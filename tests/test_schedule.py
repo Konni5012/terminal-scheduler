@@ -255,6 +255,40 @@ class ScheduleTests(unittest.TestCase):
             except ProcessLookupError:
                 pass
 
+    def test_termination_drains_verbose_cleanup_output(self) -> None:
+        command_pid_path = self.work / "verbose-command-pid"
+        command_code = (
+            "import os, signal, sys, time\n"
+            "def stop(_signal, _frame):\n"
+            "    sys.stdout.write('cleanup-output-' + ('x' * 200000))\n"
+            "    sys.stdout.write('-cleanup-finished\\n')\n"
+            "    sys.stdout.flush()\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "signal.signal(signal.SIGHUP, stop)\n"
+            f"open({str(command_pid_path)!r}, 'w').write(str(os.getpid()))\n"
+            "time.sleep(30)\n"
+        )
+        self.add(
+            f"exec {shlex.quote(sys.executable)} -c {shlex.quote(command_code)}"
+        )
+        started = self.cli("run", "--background")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        match = re.search(r"PID (\d+)", started.stdout)
+        self.assertIsNotNone(match, started.stdout)
+        assert match is not None
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not command_pid_path.exists():
+            time.sleep(0.05)
+        self.assertTrue(command_pid_path.exists(), "command did not start")
+
+        os.kill(int(match.group(1)), signal.SIGTERM)
+        self.wait_until_idle()
+        log = self.cli("log")
+        self.assertEqual(log.returncode, 0, log.stderr)
+        self.assertIn("cleanup-finished", log.stdout)
+
     def test_active_run_rules(self) -> None:
         self.add("sleep 3")
         background = self.cli("run", "--background")
