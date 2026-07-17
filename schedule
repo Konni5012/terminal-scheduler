@@ -27,6 +27,7 @@ VERSION = "1.0.0"
 SCHEMA_VERSION = "1"
 ACTIVE_STATUSES = ("starting", "running")
 FINISHED_STATUSES = ("succeeded", "failed", "interrupted", "spawn_failed")
+TERMINATION_GRACE_SECONDS = 5.0
 
 
 class ScheduleError(Exception):
@@ -35,6 +36,14 @@ class ScheduleError(Exception):
 
 class QueueEmpty(Exception):
     """Raised when a run is requested for an empty queue."""
+
+
+class WorkerTermination(Exception):
+    """Raised inside the worker when it receives a termination signal."""
+
+    def __init__(self, signal_number: int) -> None:
+        super().__init__(signal_number)
+        self.signal_number = signal_number
 
 
 def utc_now() -> str:
@@ -298,6 +307,8 @@ class WorkerSignalRelay:
         if self.received is None:
             self.received = signal_number
         self._forward(signal_number)
+        if self.process is not None:
+            raise WorkerTermination(self.received)
 
     def _forward(self, signal_number: int) -> None:
         if self.process is None:
@@ -311,6 +322,7 @@ class WorkerSignalRelay:
         self.process = process
         if self.received is not None:
             self._forward(self.received)
+            raise WorkerTermination(self.received)
 
     def detach(self, process: subprocess.Popen[bytes]) -> None:
         if self.process is process:
@@ -621,6 +633,57 @@ def normalized_exit_code(return_code: int) -> int:
     return return_code
 
 
+def command_group_exists(group_id: int) -> bool:
+    try:
+        os.killpg(group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def wait_for_command_group(
+    process: subprocess.Popen[bytes], timeout: float
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        process.poll()
+        if not command_group_exists(process.pid):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
+
+
+def stop_command_group(
+    process: subprocess.Popen[bytes], initial_signal: int
+) -> int:
+    for signal_number in dict.fromkeys((initial_signal, signal.SIGTERM)):
+        try:
+            os.killpg(process.pid, signal_number)
+        except ProcessLookupError:
+            break
+        if wait_for_command_group(process, TERMINATION_GRACE_SECONDS):
+            break
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        wait_for_command_group(process, TERMINATION_GRACE_SECONDS)
+
+    return_code = process.poll()
+    if return_code is None:
+        try:
+            return_code = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return_code = process.wait()
+    return return_code
+
+
 def run_summary(
     status: str, attempted: int, total: int, failures: int, exit_code: int
 ) -> str:
@@ -659,33 +722,48 @@ def command_result(
 
     interruption_signal: Optional[int] = None
     if signal_relay is not None:
-        signal_relay.attach(process)
+        try:
+            signal_relay.attach(process)
+        except WorkerTermination as termination:
+            signal_relay.detach(process)
+            interruption_signal = termination.signal_number
+            return_code = stop_command_group(process, interruption_signal)
     assert process.stdout is not None
     try:
-        while True:
-            chunk = process.stdout.read(65536)
-            if not chunk:
-                break
-            writer.write(chunk)
-        return_code = process.wait()
-    except KeyboardInterrupt:
-        interruption_signal = signal.SIGINT
-        try:
-            process.send_signal(signal.SIGINT)
-            return_code = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            try:
-                return_code = process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                return_code = process.wait()
-        except ProcessLookupError:
+        if interruption_signal is None:
+            while True:
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                writer.write(chunk)
             return_code = process.wait()
-    finally:
-        process.stdout.close()
+    except WorkerTermination as termination:
         if signal_relay is not None:
             signal_relay.detach(process)
+        interruption_signal = termination.signal_number
+        return_code = stop_command_group(process, interruption_signal)
+    except KeyboardInterrupt:
+        interruption_signal = signal.SIGINT
+        if signal_relay is not None:
+            signal_relay.detach(process)
+            return_code = stop_command_group(process, interruption_signal)
+        else:
+            try:
+                process.send_signal(signal.SIGINT)
+                return_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    return_code = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    return_code = process.wait()
+            except ProcessLookupError:
+                return_code = process.wait()
+    finally:
+        if signal_relay is not None:
+            signal_relay.detach(process)
+        process.stdout.close()
     if signal_relay is not None and signal_relay.received is not None:
         interruption_signal = signal_relay.received
     return normalized_exit_code(return_code), interruption_signal

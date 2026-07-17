@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -198,7 +200,16 @@ class ScheduleTests(unittest.TestCase):
 
     def test_terminating_background_worker_stops_its_command(self) -> None:
         command_pid_path = self.work / "command-pid"
-        self.add(f"echo $fish_pid > {command_pid_path}; exec sleep 30")
+        command_code = (
+            "import os, signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+            f"open({str(command_pid_path)!r}, 'w').write(str(os.getpid())); "
+            "time.sleep(30)"
+        )
+        self.add(
+            f"exec {shlex.quote(sys.executable)} -c {shlex.quote(command_code)}"
+        )
         started = self.cli("run", "--background")
         self.assertEqual(started.returncode, 0, started.stderr)
         match = re.search(r"PID (\d+)", started.stdout)
@@ -213,8 +224,10 @@ class ScheduleTests(unittest.TestCase):
         command_pid = int(command_pid_path.read_text().strip())
 
         try:
+            terminated_at = time.monotonic()
             os.kill(worker_pid, signal.SIGTERM)
             self.wait_until_idle()
+            self.assertLess(time.monotonic() - terminated_at, 8)
 
             connection = self.database()
             try:
