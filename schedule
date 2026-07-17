@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import select
 import sqlite3
 import subprocess
 import sys
@@ -27,6 +28,7 @@ VERSION = "1.0.0"
 SCHEMA_VERSION = "1"
 ACTIVE_STATUSES = ("starting", "running")
 FINISHED_STATUSES = ("succeeded", "failed", "interrupted", "spawn_failed")
+TERMINATION_GRACE_SECONDS = 5.0
 
 
 class ScheduleError(Exception):
@@ -35,6 +37,14 @@ class ScheduleError(Exception):
 
 class QueueEmpty(Exception):
     """Raised when a run is requested for an empty queue."""
+
+
+class WorkerTermination(Exception):
+    """Raised inside the worker when it receives a termination signal."""
+
+    def __init__(self, signal_number: int) -> None:
+        super().__init__(signal_number)
+        self.signal_number = signal_number
 
 
 def utc_now() -> str:
@@ -110,8 +120,8 @@ def transaction(connection: sqlite3.Connection, immediate: bool = False) -> Iter
 
 
 class State:
-    def __init__(self) -> None:
-        self.root = state_directory()
+    def __init__(self, root: Optional[Path] = None) -> None:
+        self.root = root.resolve() if root is not None else state_directory()
         self.logs = self.root / "logs"
         self.database = self.root / "schedule.db"
         self.lock_path = self.root / "active.lock"
@@ -270,6 +280,54 @@ class ActiveLock:
 
     def __exit__(self, *_: object) -> None:
         self.release()
+
+
+class WorkerSignalRelay:
+    """Forward worker termination signals to the active command group."""
+
+    def __init__(self) -> None:
+        self.process: Optional[subprocess.Popen[bytes]] = None
+        self.received: Optional[int] = None
+        self.previous_handlers: dict[int, object] = {}
+
+    def __enter__(self) -> "WorkerSignalRelay":
+        for signal_name in ("SIGTERM", "SIGHUP"):
+            signal_number = getattr(signal, signal_name, None)
+            if signal_number is None:
+                continue
+            self.previous_handlers[signal_number] = signal.getsignal(signal_number)
+            signal.signal(signal_number, self._handle)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        for signal_number, previous_handler in self.previous_handlers.items():
+            signal.signal(signal_number, previous_handler)
+        self.previous_handlers.clear()
+
+    def _handle(self, signal_number: int, _frame: object) -> None:
+        if self.received is None:
+            self.received = signal_number
+        self._forward(signal_number)
+        if self.process is not None:
+            raise WorkerTermination(self.received)
+
+    def _forward(self, signal_number: int) -> None:
+        if self.process is None:
+            return
+        try:
+            os.killpg(self.process.pid, signal_number)
+        except OSError:
+            pass
+
+    def attach(self, process: subprocess.Popen[bytes]) -> None:
+        self.process = process
+        if self.received is not None:
+            self._forward(self.received)
+            raise WorkerTermination(self.received)
+
+    def detach(self, process: subprocess.Popen[bytes]) -> None:
+        if self.process is process:
+            self.process = None
 
 
 def active_run_message(state: State) -> str:
@@ -576,6 +634,74 @@ def normalized_exit_code(return_code: int) -> int:
     return return_code
 
 
+def command_group_exists(group_id: int) -> bool:
+    try:
+        os.killpg(group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def wait_for_command_group(
+    process: subprocess.Popen[bytes], writer: LogWriter, timeout: float
+) -> bool:
+    deadline = time.monotonic() + timeout
+    assert process.stdout is not None
+    output_open = True
+    while True:
+        process.poll()
+        if not command_group_exists(process.pid):
+            while output_open:
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                writer.write(chunk)
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        interval = min(0.05, remaining)
+        if not output_open:
+            time.sleep(interval)
+            continue
+        readable, _, _ = select.select([process.stdout], [], [], interval)
+        if readable:
+            chunk = process.stdout.read(65536)
+            if chunk:
+                writer.write(chunk)
+            else:
+                output_open = False
+
+
+def stop_command_group(
+    process: subprocess.Popen[bytes], writer: LogWriter, initial_signal: int
+) -> int:
+    for signal_number in dict.fromkeys((initial_signal, signal.SIGTERM)):
+        try:
+            os.killpg(process.pid, signal_number)
+        except ProcessLookupError:
+            break
+        if wait_for_command_group(process, writer, TERMINATION_GRACE_SECONDS):
+            break
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        wait_for_command_group(process, writer, TERMINATION_GRACE_SECONDS)
+
+    return_code = process.poll()
+    if return_code is None:
+        try:
+            return_code = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return_code = process.wait()
+    return return_code
+
+
 def run_summary(
     status: str, attempted: int, total: int, failures: int, exit_code: int
 ) -> str:
@@ -595,7 +721,8 @@ def command_result(
     command: str,
     cwd: str,
     foreground: bool,
-) -> tuple[int, bool]:
+    signal_relay: Optional[WorkerSignalRelay] = None,
+) -> tuple[int, Optional[int]]:
     try:
         process = subprocess.Popen(
             [fish_path, "-c", command],
@@ -605,40 +732,67 @@ def command_result(
             stderr=subprocess.STDOUT,
             bufsize=0,
             close_fds=True,
+            start_new_session=not foreground,
         )
     except OSError as error:
         writer.line(f"schedule: could not start command: {error}")
-        return 127, False
+        return 127, None
 
-    interrupted = False
+    interruption_signal: Optional[int] = None
+    if signal_relay is not None:
+        try:
+            signal_relay.attach(process)
+        except WorkerTermination as termination:
+            signal_relay.detach(process)
+            interruption_signal = termination.signal_number
+            return_code = stop_command_group(process, writer, interruption_signal)
     assert process.stdout is not None
     try:
-        while True:
-            chunk = process.stdout.read(65536)
-            if not chunk:
-                break
-            writer.write(chunk)
-        return_code = process.wait()
+        if interruption_signal is None:
+            while True:
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                writer.write(chunk)
+            return_code = process.wait()
+    except WorkerTermination as termination:
+        if signal_relay is not None:
+            signal_relay.detach(process)
+        interruption_signal = termination.signal_number
+        return_code = stop_command_group(process, writer, interruption_signal)
     except KeyboardInterrupt:
-        interrupted = True
-        try:
-            process.send_signal(signal.SIGINT)
-            return_code = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.terminate()
+        interruption_signal = signal.SIGINT
+        if signal_relay is not None:
+            signal_relay.detach(process)
+            return_code = stop_command_group(process, writer, interruption_signal)
+        else:
             try:
+                process.send_signal(signal.SIGINT)
                 return_code = process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                process.kill()
+                process.terminate()
+                try:
+                    return_code = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    return_code = process.wait()
+            except ProcessLookupError:
                 return_code = process.wait()
-        except ProcessLookupError:
-            return_code = process.wait()
     finally:
+        if signal_relay is not None:
+            signal_relay.detach(process)
         process.stdout.close()
-    return normalized_exit_code(return_code), interrupted
+    if signal_relay is not None and signal_relay.received is not None:
+        interruption_signal = signal_relay.received
+    return normalized_exit_code(return_code), interruption_signal
 
 
-def run_worker(state: State, run_id: int, token: str) -> int:
+def run_worker(
+    state: State,
+    run_id: int,
+    token: str,
+    signal_relay: Optional[WorkerSignalRelay] = None,
+) -> int:
     connection = state.connect()
     try:
         run = connection.execute(
@@ -670,8 +824,11 @@ def run_worker(state: State, run_id: int, token: str) -> int:
             )
             attempted = 0
             failures = 0
-            was_interrupted = False
+            interruption_signal: Optional[int] = None
             for item in items:
+                if signal_relay is not None and signal_relay.received is not None:
+                    interruption_signal = signal_relay.received
+                    break
                 item_id = int(item["queue_id"])
                 started_at = utc_now()
                 with transaction(connection, immediate=True):
@@ -681,18 +838,20 @@ def run_worker(state: State, run_id: int, token: str) -> int:
                         (started_at, run_id, item_id),
                     )
                 writer.line(f"[{item_id}] {terminal_text(str(item['command']).strip())}")
-                exit_code, interrupted = command_result(
+                exit_code, item_interruption_signal = command_result(
                     writer,
                     fish_path,
                     str(item["command"]),
                     str(item["cwd"]),
                     foreground,
+                    signal_relay,
                 )
                 attempted += 1
                 failed = exit_code != 0
                 if failed:
                     failures += 1
-                was_interrupted = was_interrupted or interrupted
+                if item_interruption_signal is not None:
+                    interruption_signal = item_interruption_signal
                 finished_at = utc_now()
                 item_status = "failed" if failed else "succeeded"
                 with transaction(connection, immediate=True):
@@ -713,12 +872,12 @@ def run_worker(state: State, run_id: int, token: str) -> int:
                     writer.line()
                 if failed:
                     writer.line(f"✗ exit {exit_code}")
-                if interrupted or (failed and not no_exit_on_error):
+                if item_interruption_signal is not None or (failed and not no_exit_on_error):
                     break
 
-            if was_interrupted:
+            if interruption_signal is not None:
                 status = "interrupted"
-                overall_exit = 130
+                overall_exit = 128 + interruption_signal
             elif failures:
                 status = "failed"
                 overall_exit = 1
@@ -790,6 +949,7 @@ def execute_run(state: State, background: bool, no_exit_on_error: bool) -> int:
             str(run_id),
             token,
             str(lock.fd),
+            str(state.root),
         ]
         try:
             process = subprocess.Popen(
@@ -1065,7 +1225,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def internal_worker(arguments: Sequence[str]) -> int:
-    if len(arguments) != 3:
+    if len(arguments) != 4:
         return 2
     try:
         run_id = positive_id(arguments[0])
@@ -1075,19 +1235,20 @@ def internal_worker(arguments: Sequence[str]) -> int:
             return 2
     except (ValueError, argparse.ArgumentTypeError):
         return 2
-    state = State()
-    state.initialize()
+    state = State(Path(arguments[3]))
     lock = ActiveLock(state, inherited_fd=lock_fd)
-    try:
-        return run_worker(state, run_id, token)
-    except BaseException as error:
+    with WorkerSignalRelay() as signal_relay:
         try:
-            mark_spawn_failed(state, run_id, f"worker failed: {error}")
-        except BaseException:
-            pass
-        return 1
-    finally:
-        lock.release()
+            state.initialize()
+            return run_worker(state, run_id, token, signal_relay)
+        except BaseException as error:
+            try:
+                mark_spawn_failed(state, run_id, f"worker failed: {error}")
+            except BaseException:
+                pass
+            return 1
+        finally:
+            lock.release()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
