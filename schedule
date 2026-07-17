@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+"""A persistent, sequential command queue for the Fish shell."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import itertools
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import unicodedata
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import BinaryIO, Iterable, Iterator, Optional, Sequence
+import uuid
+
+
+VERSION = "1.0.0"
+SCHEMA_VERSION = "1"
+ACTIVE_STATUSES = ("starting", "running")
+FINISHED_STATUSES = ("succeeded", "failed", "interrupted", "spawn_failed")
+
+
+class ScheduleError(Exception):
+    """A user-facing scheduler error."""
+
+
+class QueueEmpty(Exception):
+    """Raised when a run is requested for an empty queue."""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def terminal_text(value: object) -> str:
+    """Render untrusted stored text without allowing it to forge terminal rows."""
+    escaped = []
+    replacements = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    for character in str(value):
+        if character in replacements:
+            escaped.append(replacements[character])
+        elif unicodedata.category(character).startswith("C"):
+            codepoint = ord(character)
+            escaped.append(f"\\u{codepoint:04x}" if codepoint <= 0xFFFF else f"\\U{codepoint:08x}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
+def display_width(value: str) -> int:
+    width = 0
+    for character in value:
+        if unicodedata.combining(character):
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+    return width
+
+
+def print_table(headers: Sequence[str], rows: Iterable[Sequence[object]]) -> None:
+    rendered_rows = [[str(cell) for cell in row] for row in rows]
+    widths = [display_width(header) for header in headers]
+    for row in rendered_rows:
+        for index, cell in enumerate(row[:-1]):
+            widths[index] = max(widths[index], display_width(cell))
+
+    def render(row: Sequence[str]) -> str:
+        padded = []
+        for index, cell in enumerate(row):
+            if index == len(row) - 1:
+                padded.append(cell)
+            else:
+                padding = widths[index] - display_width(cell)
+                padded.append(cell + (" " * padding))
+        return "  ".join(padded)
+
+    print(render(headers))
+    for row in rendered_rows:
+        print(render(row))
+
+
+def state_directory() -> Path:
+    override = os.environ.get("SCHEDULE_STATE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    if xdg_state:
+        return (Path(xdg_state).expanduser() / "schedule").resolve()
+    return (Path.home() / ".local" / "state" / "schedule").resolve()
+
+
+@contextmanager
+def transaction(connection: sqlite3.Connection, immediate: bool = False) -> Iterator[None]:
+    connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+    try:
+        yield
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+class State:
+    def __init__(self) -> None:
+        self.root = state_directory()
+        self.logs = self.root / "logs"
+        self.database = self.root / "schedule.db"
+        self.lock_path = self.root / "active.lock"
+
+    def initialize(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.logs.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.root, 0o700)
+            os.chmod(self.logs, 0o700)
+        except OSError as error:
+            raise ScheduleError(f"cannot secure state directory {self.root}: {error}") from error
+
+        connection = self.connect(initialize=False)
+        try:
+            with transaction(connection, immediate=True):
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS metadata "
+                    "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                version = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'"
+                ).fetchone()
+                if version is not None and version[0] != SCHEMA_VERSION:
+                    raise ScheduleError(
+                        f"unsupported database schema {version[0]}; expected {SCHEMA_VERSION}"
+                    )
+                connection.execute(
+                    "INSERT OR IGNORE INTO metadata(key, value) VALUES('schema_version', ?)",
+                    (SCHEMA_VERSION,),
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS queue (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        position INTEGER NOT NULL,
+                        command TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS queue_order ON queue(position, id)"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        token TEXT NOT NULL UNIQUE,
+                        status TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        no_exit_on_error INTEGER NOT NULL,
+                        fish_path TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        started_at TEXT,
+                        finished_at TEXT,
+                        pid INTEGER,
+                        log_path TEXT NOT NULL,
+                        total INTEGER NOT NULL DEFAULT 0,
+                        attempted INTEGER NOT NULL DEFAULT 0,
+                        failures INTEGER NOT NULL DEFAULT 0,
+                        exit_code INTEGER,
+                        message TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS run_items (
+                        run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                        queue_id INTEGER NOT NULL,
+                        sequence INTEGER NOT NULL,
+                        command TEXT NOT NULL,
+                        cwd TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        started_at TEXT,
+                        finished_at TEXT,
+                        exit_code INTEGER,
+                        PRIMARY KEY(run_id, queue_id)
+                    )
+                    """
+                )
+            try:
+                os.chmod(self.database, 0o600)
+            except OSError as error:
+                raise ScheduleError(f"cannot secure database {self.database}: {error}") from error
+        finally:
+            connection.close()
+
+    def connect(self, initialize: bool = True) -> sqlite3.Connection:
+        if initialize and not self.database.exists():
+            self.initialize()
+        try:
+            connection = sqlite3.connect(
+                str(self.database), timeout=30.0, isolation_level=None
+            )
+        except sqlite3.Error as error:
+            raise ScheduleError(f"cannot open scheduler database: {error}") from error
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
+
+    def create_log(self, path: Path) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            raise ScheduleError(f"refusing to overwrite existing log {path}")
+        except OSError as error:
+            raise ScheduleError(f"cannot create log {path}: {error}") from error
+        else:
+            os.close(descriptor)
+
+
+class ActiveLock:
+    def __init__(self, state: State, inherited_fd: Optional[int] = None) -> None:
+        self.state = state
+        self.fd: Optional[int] = inherited_fd
+        self.owned = inherited_fd is not None
+
+    def acquire(self) -> bool:
+        if self.fd is None:
+            try:
+                self.fd = os.open(self.state.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                os.chmod(self.state.lock_path, 0o600)
+            except OSError as error:
+                raise ScheduleError(f"cannot open active-run lock: {error}") from error
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            raise ScheduleError(f"cannot lock scheduler: {error}") from error
+        self.owned = True
+        return True
+
+    def release(self) -> None:
+        if self.fd is None:
+            return
+        try:
+            if self.owned:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+            self.fd = None
+            self.owned = False
+
+    def __enter__(self) -> "ActiveLock":
+        if not self.acquire():
+            self.release()
+            raise ScheduleError(active_run_message(self.state))
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
+
+
+def active_run_message(state: State) -> str:
+    connection = state.connect()
+    try:
+        row = connection.execute(
+            "SELECT id, pid FROM runs WHERE status IN ('starting', 'running') "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return "another scheduler operation is active"
+    pid_text = f" (PID {row['pid']})" if row["pid"] else ""
+    return f"run {row['id']} is active{pid_text}"
+
+
+def resolved_fish() -> str:
+    fish = shutil.which("fish")
+    if not fish:
+        raise ScheduleError("Fish was not found in PATH")
+    return str(Path(fish).resolve())
+
+
+def validate_command(command: str) -> None:
+    if not command.strip():
+        raise ScheduleError("command must not be empty")
+    if "\x00" in command:
+        raise ScheduleError("command must not contain a NUL byte")
+    fish = resolved_fish()
+    result = subprocess.run(
+        [fish, "--no-execute", "-c", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.decode(errors="replace").strip()
+        if not diagnostic:
+            diagnostic = "Fish rejected the command"
+        raise ScheduleError(f"invalid Fish syntax:\n{diagnostic}")
+
+
+def add_command(state: State, command: str) -> int:
+    validate_command(command)
+    cwd = str(Path.cwd().resolve())
+    connection = state.connect()
+    try:
+        with transaction(connection, immediate=True):
+            row = connection.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM queue").fetchone()
+            position = int(row[0])
+            cursor = connection.execute(
+                "INSERT INTO queue(position, command, cwd, created_at) VALUES(?, ?, ?, ?)",
+                (position, command, cwd, utc_now()),
+            )
+            command_id = int(cursor.lastrowid)
+    finally:
+        connection.close()
+    print(f"Added command {command_id} at queue position {position}.")
+    return command_id
+
+
+def queue_rows(state: State) -> list[sqlite3.Row]:
+    connection = state.connect()
+    try:
+        return list(
+            connection.execute(
+                "SELECT id, position, command, cwd, created_at FROM queue ORDER BY position, id"
+            )
+        )
+    finally:
+        connection.close()
+
+
+def print_queue(state: State) -> None:
+    rows = queue_rows(state)
+    if not rows:
+        print("Queue is empty.")
+        return
+    print_table(
+        ("POSITION", "ID", "WORKING DIRECTORY", "COMMAND"),
+        (
+            (
+                index,
+                row["id"],
+                terminal_text(row["cwd"]),
+                terminal_text(row["command"]),
+            )
+            for index, row in enumerate(rows, 1)
+        ),
+    )
+
+
+def reject_mutation_during_run(state: State) -> ActiveLock:
+    lock = ActiveLock(state)
+    if not lock.acquire():
+        lock.release()
+        raise ScheduleError(f"cannot modify queue while {active_run_message(state)}")
+    return lock
+
+
+def swap_commands(state: State, first_id: int, second_id: int) -> None:
+    lock = reject_mutation_during_run(state)
+    try:
+        connection = state.connect()
+        try:
+            with transaction(connection, immediate=True):
+                rows = list(
+                    connection.execute(
+                        "SELECT id, position FROM queue WHERE id IN (?, ?)",
+                        (first_id, second_id),
+                    )
+                )
+                found = {int(row["id"]): int(row["position"]) for row in rows}
+                missing = [value for value in dict.fromkeys((first_id, second_id)) if value not in found]
+                if missing:
+                    label = ", ".join(str(value) for value in missing)
+                    raise ScheduleError(f"queued command ID not found: {label}")
+                if first_id != second_id:
+                    connection.execute(
+                        "UPDATE queue SET position = CASE id WHEN ? THEN ? WHEN ? THEN ? END "
+                        "WHERE id IN (?, ?)",
+                        (
+                            first_id,
+                            found[second_id],
+                            second_id,
+                            found[first_id],
+                            first_id,
+                            second_id,
+                        ),
+                    )
+        finally:
+            connection.close()
+    finally:
+        lock.release()
+    if first_id == second_id:
+        print(f"Command {first_id} is already in that position.")
+    else:
+        print(f"Swapped queue positions of commands {first_id} and {second_id}.")
+
+
+def remove_commands(state: State, command_ids: Sequence[int]) -> None:
+    unique_ids = list(dict.fromkeys(command_ids))
+    lock = reject_mutation_during_run(state)
+    try:
+        connection = state.connect()
+        try:
+            with transaction(connection, immediate=True):
+                placeholders = ",".join("?" for _ in unique_ids)
+                found = {
+                    int(row[0])
+                    for row in connection.execute(
+                        f"SELECT id FROM queue WHERE id IN ({placeholders})", unique_ids
+                    )
+                }
+                missing = [value for value in unique_ids if value not in found]
+                if missing:
+                    label = ", ".join(str(value) for value in missing)
+                    raise ScheduleError(f"queued command ID not found: {label}")
+                connection.execute(
+                    f"DELETE FROM queue WHERE id IN ({placeholders})", unique_ids
+                )
+        finally:
+            connection.close()
+    finally:
+        lock.release()
+    noun = "command" if len(unique_ids) == 1 else "commands"
+    print(f"Removed {noun} {', '.join(str(value) for value in unique_ids)}.")
+
+
+def mark_stale_runs(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "UPDATE runs SET status = 'interrupted', finished_at = ?, exit_code = 130, "
+        "message = 'worker ended without completing the run' "
+        "WHERE status IN ('starting', 'running')",
+        (utc_now(),),
+    )
+
+
+def create_run(
+    state: State, mode: str, no_exit_on_error: bool, fish_path: str
+) -> tuple[int, str]:
+    connection = state.connect()
+    run_id: Optional[int] = None
+    token = uuid.uuid4().hex
+    log_path: Optional[Path] = None
+    queue_was_empty = False
+    try:
+        with transaction(connection, immediate=True):
+            mark_stale_runs(connection)
+            queued = list(
+                connection.execute(
+                    "SELECT id, command, cwd FROM queue ORDER BY position, id"
+                )
+            )
+            if not queued:
+                queue_was_empty = True
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO runs(
+                        token, status, mode, no_exit_on_error, fish_path, created_at,
+                        pid, log_path, total
+                    ) VALUES(?, 'starting', ?, ?, ?, ?, ?, '', ?)
+                    """,
+                    (
+                        token,
+                        mode,
+                        int(no_exit_on_error),
+                        fish_path,
+                        utc_now(),
+                        os.getpid(),
+                        len(queued),
+                    ),
+                )
+                run_id = int(cursor.lastrowid)
+                log_path = state.logs / f"run-{run_id}.log"
+                connection.execute(
+                    "UPDATE runs SET log_path = ? WHERE id = ?", (str(log_path), run_id)
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO run_items(run_id, queue_id, sequence, command, cwd)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (run_id, int(row["id"]), index, row["command"], row["cwd"])
+                        for index, row in enumerate(queued, 1)
+                    ],
+                )
+        if queue_was_empty:
+            raise QueueEmpty()
+        assert log_path is not None
+        try:
+            state.create_log(log_path)
+        except BaseException as error:
+            with transaction(connection, immediate=True):
+                connection.execute(
+                    "UPDATE runs SET status = 'spawn_failed', finished_at = ?, "
+                    "exit_code = 1, message = ? WHERE id = ?",
+                    (utc_now(), str(error), run_id),
+                )
+            raise
+    finally:
+        connection.close()
+    assert run_id is not None
+    return run_id, token
+
+
+def update_run_pid(state: State, run_id: int, pid: int) -> None:
+    connection = state.connect()
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute("UPDATE runs SET pid = ? WHERE id = ?", (pid, run_id))
+    finally:
+        connection.close()
+
+
+class LogWriter:
+    def __init__(self, file: BinaryIO, foreground: bool) -> None:
+        self.file = file
+        self.foreground = foreground
+        self.stdout_broken = False
+        self.last_byte = b""
+
+    def write(self, data: bytes) -> None:
+        if data:
+            self.last_byte = data[-1:]
+        remaining = memoryview(data)
+        while remaining:
+            written = self.file.write(remaining)
+            if written is None:
+                break
+            if written == 0:
+                raise OSError("log write returned zero bytes")
+            remaining = remaining[written:]
+        self.file.flush()
+        if self.foreground and not self.stdout_broken:
+            try:
+                write_all_fd(sys.stdout.fileno(), data)
+            except OSError:
+                self.stdout_broken = True
+
+    def line(self, text: str = "") -> None:
+        self.write((text + "\n").encode("utf-8", errors="replace"))
+
+
+def write_all_fd(descriptor: int, data: bytes) -> None:
+    remaining = memoryview(data)
+    while remaining:
+        try:
+            written = os.write(descriptor, remaining)
+        except InterruptedError:
+            continue
+        if written == 0:
+            raise OSError("output write returned zero bytes")
+        remaining = remaining[written:]
+
+
+def normalized_exit_code(return_code: int) -> int:
+    if return_code < 0:
+        return 128 + abs(return_code)
+    return return_code
+
+
+def run_summary(
+    status: str, attempted: int, total: int, failures: int, exit_code: int
+) -> str:
+    if status == "succeeded":
+        noun = "command" if attempted == 1 else "commands"
+        return f"✓ succeeded · {attempted} {noun}"
+    failure_text = ""
+    if failures:
+        noun = "failure" if failures == 1 else "failures"
+        failure_text = f" · {failures} {noun}"
+    return f"✗ {status} · {attempted}/{total} commands{failure_text} · exit {exit_code}"
+
+
+def command_result(
+    writer: LogWriter,
+    fish_path: str,
+    command: str,
+    cwd: str,
+    foreground: bool,
+) -> tuple[int, bool]:
+    try:
+        process = subprocess.Popen(
+            [fish_path, "-c", command],
+            cwd=cwd,
+            stdin=None if foreground else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            close_fds=True,
+        )
+    except OSError as error:
+        writer.line(f"schedule: could not start command: {error}")
+        return 127, False
+
+    interrupted = False
+    assert process.stdout is not None
+    try:
+        while True:
+            chunk = process.stdout.read(65536)
+            if not chunk:
+                break
+            writer.write(chunk)
+        return_code = process.wait()
+    except KeyboardInterrupt:
+        interrupted = True
+        try:
+            process.send_signal(signal.SIGINT)
+            return_code = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                return_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return_code = process.wait()
+        except ProcessLookupError:
+            return_code = process.wait()
+    finally:
+        process.stdout.close()
+    return normalized_exit_code(return_code), interrupted
+
+
+def run_worker(state: State, run_id: int, token: str) -> int:
+    connection = state.connect()
+    try:
+        run = connection.execute(
+            "SELECT * FROM runs WHERE id = ? AND token = ?", (run_id, token)
+        ).fetchone()
+        if run is None:
+            raise ScheduleError("invalid internal worker credentials")
+        if run["status"] not in ACTIVE_STATUSES:
+            raise ScheduleError(f"run {run_id} is already {run['status']}")
+        foreground = run["mode"] == "foreground"
+        no_exit_on_error = bool(run["no_exit_on_error"])
+        fish_path = str(run["fish_path"])
+        log_path = Path(run["log_path"])
+        with transaction(connection, immediate=True):
+            connection.execute(
+                "UPDATE runs SET status = 'running', started_at = ?, pid = ? WHERE id = ?",
+                (utc_now(), os.getpid(), run_id),
+            )
+
+        descriptor = os.open(log_path, os.O_WRONLY | os.O_APPEND)
+        with os.fdopen(descriptor, "ab", buffering=0) as log_file:
+            writer = LogWriter(log_file, foreground)
+            writer.line(f"run {run_id} · {run['mode']}")
+            items = list(
+                connection.execute(
+                    "SELECT * FROM run_items WHERE run_id = ? ORDER BY sequence",
+                    (run_id,),
+                )
+            )
+            attempted = 0
+            failures = 0
+            was_interrupted = False
+            for item in items:
+                item_id = int(item["queue_id"])
+                started_at = utc_now()
+                with transaction(connection, immediate=True):
+                    connection.execute(
+                        "UPDATE run_items SET status = 'running', started_at = ? "
+                        "WHERE run_id = ? AND queue_id = ?",
+                        (started_at, run_id, item_id),
+                    )
+                writer.line(f"[{item_id}] {terminal_text(str(item['command']).strip())}")
+                exit_code, interrupted = command_result(
+                    writer,
+                    fish_path,
+                    str(item["command"]),
+                    str(item["cwd"]),
+                    foreground,
+                )
+                attempted += 1
+                failed = exit_code != 0
+                if failed:
+                    failures += 1
+                was_interrupted = was_interrupted or interrupted
+                finished_at = utc_now()
+                item_status = "failed" if failed else "succeeded"
+                with transaction(connection, immediate=True):
+                    connection.execute(
+                        """
+                        UPDATE run_items
+                        SET status = ?, finished_at = ?, exit_code = ?
+                        WHERE run_id = ? AND queue_id = ?
+                        """,
+                        (item_status, finished_at, exit_code, run_id, item_id),
+                    )
+                    connection.execute("DELETE FROM queue WHERE id = ?", (item_id,))
+                    connection.execute(
+                        "UPDATE runs SET attempted = ?, failures = ? WHERE id = ?",
+                        (attempted, failures, run_id),
+                    )
+                if writer.last_byte != b"\n":
+                    writer.line()
+                if failed:
+                    writer.line(f"✗ exit {exit_code}")
+                if interrupted or (failed and not no_exit_on_error):
+                    break
+
+            if was_interrupted:
+                status = "interrupted"
+                overall_exit = 130
+            elif failures:
+                status = "failed"
+                overall_exit = 1
+            else:
+                status = "succeeded"
+                overall_exit = 0
+            with transaction(connection, immediate=True):
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, finished_at = ?, attempted = ?, failures = ?, exit_code = ?
+                    WHERE id = ?
+                    """,
+                    (status, utc_now(), attempted, failures, overall_exit, run_id),
+                )
+            writer.line(
+                run_summary(
+                    status,
+                    attempted,
+                    int(run["total"]),
+                    failures,
+                    overall_exit,
+                )
+            )
+            return overall_exit
+    finally:
+        connection.close()
+
+
+def mark_spawn_failed(state: State, run_id: int, message: str) -> None:
+    connection = state.connect()
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute(
+                "UPDATE runs SET status = 'spawn_failed', finished_at = ?, "
+                "exit_code = 1, message = ? WHERE id = ?",
+                (utc_now(), message, run_id),
+            )
+    finally:
+        connection.close()
+
+
+def execute_run(state: State, background: bool, no_exit_on_error: bool) -> int:
+    lock = ActiveLock(state)
+    if not lock.acquire():
+        lock.release()
+        raise ScheduleError(active_run_message(state))
+    try:
+        fish_path = resolved_fish()
+        try:
+            run_id, token = create_run(
+                state,
+                "background" if background else "foreground",
+                no_exit_on_error,
+                fish_path,
+            )
+        except QueueEmpty:
+            print("Queue is empty.")
+            return 0
+
+        if not background:
+            return run_worker(state, run_id, token)
+
+        assert lock.fd is not None
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "_worker",
+            str(run_id),
+            token,
+            str(lock.fd),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd="/",
+                close_fds=True,
+                pass_fds=(lock.fd,),
+                start_new_session=True,
+                env=os.environ.copy(),
+            )
+        except OSError as error:
+            mark_spawn_failed(state, run_id, str(error))
+            raise ScheduleError(f"could not start background worker: {error}") from error
+        # The inherited descriptor refers to the same locked open-file
+        # description. Closing the parent's copy preserves the worker's lock;
+        # explicitly unlocking here would also unlock the worker's copy.
+        lock.owned = False
+        update_run_pid(state, run_id, process.pid)
+        print(
+            f"Started run {run_id} in the background (PID {process.pid}). "
+            f"View it with: schedule log {run_id}"
+        )
+        return 0
+    finally:
+        lock.release()
+
+
+def log_rows(state: State) -> list[sqlite3.Row]:
+    connection = state.connect()
+    try:
+        return list(connection.execute("SELECT * FROM runs ORDER BY id"))
+    finally:
+        connection.close()
+
+
+def print_log_list(state: State) -> None:
+    rows = log_rows(state)
+    if not rows:
+        print("No run logs.")
+        return
+    print_table(
+        ("RUN", "STATUS", "MODE", "CREATED", "FINISHED", "ATTEMPTED/TOTAL", "FAILURES"),
+        (
+            (
+                row["id"],
+                row["status"],
+                row["mode"],
+                row["created_at"],
+                row["finished_at"] or "-",
+                f"{row['attempted']}/{row['total']}",
+                row["failures"],
+            )
+            for row in rows
+        ),
+    )
+
+
+def show_log(state: State, requested_run_id: Optional[int]) -> None:
+    connection = state.connect()
+    try:
+        if requested_run_id is None:
+            row = connection.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        else:
+            row = connection.execute(
+                "SELECT * FROM runs WHERE id = ?", (requested_run_id,)
+            ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        target = "latest run" if requested_run_id is None else f"run {requested_run_id}"
+        raise ScheduleError(f"no log found for {target}")
+    path = Path(row["log_path"])
+    try:
+        with path.open("rb") as file:
+            first_line = file.readline()
+            if first_line.startswith(b"=== schedule run "):
+                show_legacy_log(row, itertools.chain((first_line,), file))
+            else:
+                if first_line and not write_stdout(first_line):
+                    return
+                while True:
+                    data = file.read(65536)
+                    if not data or not write_stdout(data):
+                        break
+    except FileNotFoundError:
+        raise ScheduleError(f"log file for run {row['id']} is missing")
+    if row["message"]:
+        print(f"schedule: run status message: {row['message']}", file=sys.stderr)
+
+
+def write_stdout(data: bytes) -> bool:
+    try:
+        write_all_fd(sys.stdout.fileno(), data)
+        return True
+    except BrokenPipeError:
+        return False
+    except OSError as error:
+        if error.errno == errno.EPIPE:
+            return False
+        raise
+
+
+def decode_legacy_command(fragment: str) -> str:
+    try:
+        return str(json.loads(f'"{fragment}"'))
+    except (json.JSONDecodeError, TypeError):
+        return fragment
+
+
+def show_legacy_log(row: sqlite3.Row, lines: Iterable[bytes]) -> None:
+    command_id: Optional[str] = None
+    awaiting_command = False
+    pending_blank: Optional[bytes] = None
+    wrote_header = False
+
+    for raw_line in lines:
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if line.startswith("=== schedule run ") and " started " in line:
+            if not write_stdout(f"run {row['id']} · {row['mode']}\n".encode()):
+                return
+            wrote_header = True
+            pending_blank = None
+            continue
+        if line.startswith("--- command id=") and " cwd=" in line and line.endswith(" ---"):
+            pending_blank = None
+            command_id = line[len("--- command id=") :].split(" ", 1)[0]
+            awaiting_command = True
+            continue
+        if awaiting_command and line.startswith("$ "):
+            command = terminal_text(decode_legacy_command(line[2:]).strip())
+            if not write_stdout(f"[{command_id}] {command}\n".encode()):
+                return
+            awaiting_command = False
+            continue
+        if line.startswith("--- command id=") and " exit=" in line and line.endswith(" ---"):
+            pending_blank = None
+            exit_fragment = line.rsplit(" exit=", 1)[1][:-4]
+            try:
+                exit_code = int(exit_fragment)
+            except ValueError:
+                exit_code = 0
+            if exit_code and not write_stdout(f"✗ exit {exit_code}\n".encode()):
+                return
+            command_id = None
+            continue
+        if line.startswith("=== schedule run ") and " finished " in line:
+            pending_blank = None
+            summary = run_summary(
+                str(row["status"]),
+                int(row["attempted"]),
+                int(row["total"]),
+                int(row["failures"]),
+                int(row["exit_code"] or 0),
+            )
+            if not write_stdout((summary + "\n").encode()):
+                return
+            continue
+        if raw_line in (b"\n", b"\r\n"):
+            if pending_blank is not None and not write_stdout(pending_blank):
+                return
+            pending_blank = raw_line
+            continue
+        if pending_blank is not None:
+            if not write_stdout(pending_blank):
+                return
+            pending_blank = None
+        if not write_stdout(raw_line):
+            return
+
+    if not wrote_header:
+        return
+    if pending_blank is not None:
+        write_stdout(pending_blank)
+
+
+def clear_logs(state: State) -> None:
+    connection = state.connect()
+    try:
+        with transaction(connection, immediate=True):
+            rows = list(
+                connection.execute(
+                    "SELECT id, log_path FROM runs WHERE status NOT IN ('starting', 'running')"
+                )
+            )
+            if rows:
+                ids = [int(row["id"]) for row in rows]
+                placeholders = ",".join("?" for _ in ids)
+                connection.execute(f"DELETE FROM runs WHERE id IN ({placeholders})", ids)
+            remaining_runs = int(connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0])
+            if remaining_runs == 0:
+                queued_ids = [
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT id FROM queue ORDER BY position, id"
+                    )
+                ]
+                connection.executemany(
+                    "UPDATE queue SET id = ? WHERE id = ?",
+                    [(-index, old_id) for index, old_id in enumerate(queued_ids, 1)],
+                )
+                connection.execute("UPDATE queue SET id = -id WHERE id < 0")
+                connection.execute("DELETE FROM sqlite_sequence WHERE name = 'runs'")
+                connection.execute("DELETE FROM sqlite_sequence WHERE name = 'queue'")
+    finally:
+        connection.close()
+    warnings = []
+    for row in rows:
+        try:
+            Path(row["log_path"]).unlink(missing_ok=True)
+        except OSError as error:
+            warnings.append(f"could not delete {row['log_path']}: {error}")
+    print(f"Cleared {len(rows)} completed run log{'s' if len(rows) != 1 else ''}.")
+    for warning in warnings:
+        print(f"schedule: warning: {warning}", file=sys.stderr)
+
+
+def positive_id(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="schedule",
+        description="Persist and sequentially run quoted Fish commands.",
+    )
+    parser.add_argument("--version", action="version", version=f"schedule {VERSION}")
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    add_parser = subparsers.add_parser("add", help="add one quoted Fish command")
+    add_parser.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="the complete command as one quoted argument",
+    )
+
+    subparsers.add_parser("list", help="list queued commands in run order")
+
+    move_parser = subparsers.add_parser("mv", help="swap two command positions")
+    move_parser.add_argument("id1", type=positive_id)
+    move_parser.add_argument("id2", type=positive_id)
+
+    remove_parser = subparsers.add_parser("rm", help="remove one or more commands")
+    remove_parser.add_argument("ids", type=positive_id, nargs="+")
+
+    run_parser = subparsers.add_parser("run", help="run the queued commands sequentially")
+    run_parser.add_argument(
+        "-b",
+        "--background",
+        action="store_true",
+        help="detach and return to the prompt immediately",
+    )
+    run_parser.add_argument(
+        "--no-exit-on-error",
+        action="store_true",
+        help="continue after a command exits unsuccessfully",
+    )
+
+    log_parser = subparsers.add_parser("log", help="read or manage run logs")
+    group = log_parser.add_mutually_exclusive_group()
+    group.add_argument("--list", action="store_true", help="list recorded runs")
+    group.add_argument("--clear", action="store_true", help="clear completed run logs")
+    log_parser.add_argument("run_id", nargs="?", type=positive_id)
+    return parser
+
+
+def internal_worker(arguments: Sequence[str]) -> int:
+    if len(arguments) != 3:
+        return 2
+    try:
+        run_id = positive_id(arguments[0])
+        token = arguments[1]
+        lock_fd = int(arguments[2])
+        if lock_fd < 0:
+            return 2
+    except (ValueError, argparse.ArgumentTypeError):
+        return 2
+    state = State()
+    state.initialize()
+    lock = ActiveLock(state, inherited_fd=lock_fd)
+    try:
+        return run_worker(state, run_id, token)
+    except BaseException as error:
+        try:
+            mark_spawn_failed(state, run_id, f"worker failed: {error}")
+        except BaseException:
+            pass
+        return 1
+    finally:
+        lock.release()
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "_worker":
+        return internal_worker(arguments[1:])
+    parser = build_parser()
+    parsed = parser.parse_args(arguments)
+    state = State()
+    try:
+        state.initialize()
+        if parsed.subcommand == "add":
+            command_arguments = parsed.command
+            if len(command_arguments) == 2 and command_arguments[0] == "--":
+                command_arguments = command_arguments[1:]
+            if len(command_arguments) != 1:
+                raise ScheduleError(
+                    "add requires exactly one quoted Fish command, for example: "
+                    "schedule add 'echo hello | string upper'"
+                )
+            add_command(state, command_arguments[0])
+            return 0
+        if parsed.subcommand == "list":
+            print_queue(state)
+            return 0
+        if parsed.subcommand == "mv":
+            swap_commands(state, parsed.id1, parsed.id2)
+            return 0
+        if parsed.subcommand == "rm":
+            remove_commands(state, parsed.ids)
+            return 0
+        if parsed.subcommand == "run":
+            return execute_run(state, parsed.background, parsed.no_exit_on_error)
+        if parsed.subcommand == "log":
+            if parsed.list:
+                if parsed.run_id is not None:
+                    raise ScheduleError("log --list does not accept a run ID")
+                print_log_list(state)
+            elif parsed.clear:
+                if parsed.run_id is not None:
+                    raise ScheduleError("log --clear does not accept a run ID")
+                clear_logs(state)
+            else:
+                show_log(state, parsed.run_id)
+            return 0
+        parser.error("unknown subcommand")
+    except ScheduleError as error:
+        print(f"schedule: error: {error}", file=sys.stderr)
+        return 2
+    except sqlite3.Error as error:
+        print(f"schedule: database error: {error}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
