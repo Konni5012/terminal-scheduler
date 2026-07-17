@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -148,6 +150,95 @@ class ScheduleTests(unittest.TestCase):
         self.wait_until_idle()
         self.assertEqual(marker.read_text().strip(), "detached")
         self.assertIn("✓ succeeded", self.cli("log").stdout)
+
+    def test_background_uses_resolved_relative_state_directory(self) -> None:
+        relative_work = self.root / "relative-work"
+        relative_work.mkdir()
+        relative_state = relative_work / "state"
+        marker = relative_work / "finished"
+        environment = os.environ.copy()
+        environment["SCHEDULE_STATE_DIR"] = "state"
+
+        def relative_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [str(SCHEDULE), *arguments],
+                cwd=relative_work,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+                check=False,
+            )
+
+        added = relative_cli("add", f"echo complete > {marker}")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        started = relative_cli("run", "--background")
+        self.assertEqual(started.returncode, 0, started.stderr)
+
+        deadline = time.monotonic() + 10
+        status = "starting"
+        while time.monotonic() < deadline:
+            if (relative_state / "schedule.db").exists():
+                connection = sqlite3.connect(relative_state / "schedule.db")
+                try:
+                    row = connection.execute(
+                        "SELECT status FROM runs ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                finally:
+                    connection.close()
+                if row is not None:
+                    status = str(row[0])
+                    if status not in ("starting", "running"):
+                        break
+            time.sleep(0.05)
+
+        self.assertEqual(status, "succeeded")
+        self.assertEqual(marker.read_text().strip(), "complete")
+
+    def test_terminating_background_worker_stops_its_command(self) -> None:
+        command_pid_path = self.work / "command-pid"
+        self.add(f"echo $fish_pid > {command_pid_path}; exec sleep 30")
+        started = self.cli("run", "--background")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        match = re.search(r"PID (\d+)", started.stdout)
+        self.assertIsNotNone(match, started.stdout)
+        assert match is not None
+        worker_pid = int(match.group(1))
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not command_pid_path.exists():
+            time.sleep(0.05)
+        self.assertTrue(command_pid_path.exists(), "command did not start")
+        command_pid = int(command_pid_path.read_text().strip())
+
+        try:
+            os.kill(worker_pid, signal.SIGTERM)
+            self.wait_until_idle()
+
+            connection = self.database()
+            try:
+                run = connection.execute(
+                    "SELECT status, exit_code FROM runs WHERE id = 1"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual((run["status"], run["exit_code"]), ("interrupted", 143))
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(command_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("command survived worker termination")
+        finally:
+            try:
+                os.kill(command_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def test_active_run_rules(self) -> None:
         self.add("sleep 3")
