@@ -119,8 +119,8 @@ def transaction(connection: sqlite3.Connection, immediate: bool = False) -> Iter
 
 
 class State:
-    def __init__(self) -> None:
-        self.root = state_directory()
+    def __init__(self, root: Optional[Path] = None) -> None:
+        self.root = root.resolve() if root is not None else state_directory()
         self.logs = self.root / "logs"
         self.database = self.root / "schedule.db"
         self.lock_path = self.root / "active.lock"
@@ -931,10 +931,9 @@ def execute_run(state: State, background: bool, no_exit_on_error: bool) -> int:
             str(run_id),
             token,
             str(lock.fd),
+            str(state.root),
         ]
         try:
-            worker_environment = os.environ.copy()
-            worker_environment["SCHEDULE_STATE_DIR"] = str(state.root)
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -944,7 +943,7 @@ def execute_run(state: State, background: bool, no_exit_on_error: bool) -> int:
                 close_fds=True,
                 pass_fds=(lock.fd,),
                 start_new_session=True,
-                env=worker_environment,
+                env=os.environ.copy(),
             )
         except OSError as error:
             mark_spawn_failed(state, run_id, str(error))
@@ -1208,7 +1207,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def internal_worker(arguments: Sequence[str]) -> int:
-    if len(arguments) != 3:
+    if len(arguments) != 4:
         return 2
     try:
         run_id = positive_id(arguments[0])
@@ -1218,7 +1217,7 @@ def internal_worker(arguments: Sequence[str]) -> int:
             return 2
     except (ValueError, argparse.ArgumentTypeError):
         return 2
-    state = State()
+    state = State(Path(arguments[3]))
     lock = ActiveLock(state, inherited_fd=lock_fd)
     with WorkerSignalRelay() as signal_relay:
         try:

@@ -173,7 +173,9 @@ class ScheduleTests(unittest.TestCase):
                 check=False,
             )
 
-        added = relative_cli("add", f"echo complete > {marker}")
+        added = relative_cli(
+            "add", f"printf '%s' \"$SCHEDULE_STATE_DIR\" > {marker}"
+        )
         self.assertEqual(added.returncode, 0, added.stderr)
         started = relative_cli("run", "--background")
         self.assertEqual(started.returncode, 0, started.stderr)
@@ -196,7 +198,7 @@ class ScheduleTests(unittest.TestCase):
             time.sleep(0.05)
 
         self.assertEqual(status, "succeeded")
-        self.assertEqual(marker.read_text().strip(), "complete")
+        self.assertEqual(marker.read_text(), "state")
 
     def test_terminating_background_worker_stops_its_command(self) -> None:
         command_pid_path = self.work / "command-pid"
