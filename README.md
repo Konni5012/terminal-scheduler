@@ -84,7 +84,3 @@ environment present when `schedule run` starts; shell-local changes made by one
 entry do not carry into the next. Fish syntax is checked when a command is
 added, while command availability and other runtime failures are determined
 during execution.
-
-## Why did I make this?
-I made it to be a simple way to schedule compute heavy jobs on a remote maschine, but you can feel free to tweak this to your liking if your usecase needs something different.
-I also apologize if the code quality is bad as this was more of a vibe project.
