@@ -308,6 +308,7 @@ class WorkerSignalRelay:
         self.lock = threading.RLock()
         self.process_start_lock = threading.RLock()
         self.received: Optional[int] = None
+        self.external_signal: Optional[int] = None
         self.raise_worker_termination = True
         self.suspended = False
         self.previous_handlers: dict[int, object] = {}
@@ -347,6 +348,8 @@ class WorkerSignalRelay:
         with self.lock:
             if self.received is None:
                 self.received = signal_number
+            if self.external_signal is None:
+                self.external_signal = signal_number
             received = self.received
             has_processes = bool(self.processes)
         self._forward(signal_number)
@@ -705,6 +708,7 @@ class LogWriter:
         self.stdout_forwarder: Optional[threading.Thread] = None
         self.stdout_forwarder_stop = threading.Event()
         self.stdout_forwarder_busy = False
+        self.stdout_forwarder_error: Optional[RuntimeError] = None
 
     @contextmanager
     def defer_stdout(self) -> Iterator[None]:
@@ -732,13 +736,27 @@ class LogWriter:
         self.stdout_queue = Queue(maxsize=STDOUT_FORWARD_QUEUE_CHUNKS)
         self.stdout_forwarder_stop.clear()
         self.stdout_forwarder_busy = False
+        self.stdout_forwarder_error = None
         self.stdout_deferred = True
         self.stdout_forwarder = threading.Thread(
             target=self._forward_stdout,
             name="schedule-stdout",
             daemon=True,
         )
-        self.stdout_forwarder.start()
+        try:
+            self.stdout_forwarder.start()
+        except RuntimeError as error:
+            spool.close()
+            self.stdout_broken = True
+            self.stdout_forwarder_error = error
+            self.stdout_deferred = False
+            self.stdout_fd = None
+            self.stdout_spool = None
+            self.stdout_spool_read_offset = 0
+            self.stdout_spool_write_offset = 0
+            self.stdout_queue = None
+            self.stdout_forwarder = None
+            self.stdout_forwarder_stop.set()
 
     def _forward_stdout(self) -> None:
         with self.lock:
@@ -1366,6 +1384,20 @@ def run_parallel_items(
     # the scheduler's point of view.
     parallel_relay.raise_worker_termination = False
 
+    if writer.stdout_forwarder_error is not None:
+        error = writer.stdout_forwarder_error
+        message = f"could not start parallel output forwarder: {error}"
+        safe_log_line(writer, f"schedule: {message}")
+        with transaction(connection, immediate=True):
+            connection.execute(
+                "UPDATE runs SET status = 'failed', finished_at = ?, "
+                "exit_code = 1, message = ? WHERE id = ?",
+                (utc_now(), message, run_id),
+            )
+        writer.line(run_summary("failed", 0, int(run["total"]), 0, 1))
+        parallel_relay.raise_worker_termination = True
+        return 1
+
     executor = ThreadPoolExecutor(
         max_workers=parallel_worker_limit(len(items)), thread_name_prefix="schedule"
     )
@@ -1459,8 +1491,8 @@ def run_parallel_items(
     writer.flush_stdout(
         wait=True, should_stop=lambda: parallel_relay.received is not None
     )
-    final_signal = parallel_relay.received
-    if status == "succeeded" and final_signal is not None:
+    final_signal = parallel_relay.external_signal
+    if status != "interrupted" and final_signal is not None:
         status = "interrupted"
         overall_exit = 128 + final_signal
     with transaction(connection, immediate=True):
@@ -1484,8 +1516,8 @@ def run_parallel_items(
     writer.flush_stdout(
         wait=True, should_stop=lambda: parallel_relay.received is not None
     )
-    final_signal = parallel_relay.received
-    if status == "succeeded" and final_signal is not None:
+    final_signal = parallel_relay.external_signal
+    if status != "interrupted" and final_signal is not None:
         status = "interrupted"
         overall_exit = 128 + final_signal
         with transaction(connection, immediate=True):
