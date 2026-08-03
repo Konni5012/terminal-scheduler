@@ -964,6 +964,9 @@ def run_parallel_items(
     submission_signal: Optional[int] = None
     try:
         for item in items:
+            if parallel_relay.received is not None:
+                submission_signal = parallel_relay.received
+                break
             try:
                 futures.append(
                     executor.submit(
