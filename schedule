@@ -1182,6 +1182,22 @@ def record_parallel_item_failure(
         connection.close()
 
 
+def restore_parallel_item_pending(state: State, run_id: int, item_id: int) -> None:
+    connection = state.connect()
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute(
+                """
+                UPDATE run_items
+                SET status = 'pending', started_at = NULL, finished_at = NULL, exit_code = NULL
+                WHERE run_id = ? AND queue_id = ? AND status = 'running'
+                """,
+                (run_id, item_id),
+            )
+    finally:
+        connection.close()
+
+
 def mark_running_parallel_items_failed(state: State, run_id: int) -> int:
     connection = state.connect()
     try:
@@ -1279,6 +1295,13 @@ def run_parallel_item(
         raise
     except BaseException as error:
         if not launch_attempted:
+            try:
+                restore_parallel_item_pending(state, run_id, item_id)
+            except BaseException as cleanup_error:
+                safe_log_line(
+                    item_writer,
+                    f"schedule: could not restore pre-launch command {item_id}: {cleanup_error}",
+                )
             raise
         message = f"parallel command {item_id} failed: {error}"
         if not item_recorded:
