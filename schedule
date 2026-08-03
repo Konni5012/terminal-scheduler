@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 import errno
 import fcntl
@@ -32,6 +33,7 @@ ACTIVE_STATUSES = ("starting", "running")
 FINISHED_STATUSES = ("succeeded", "failed", "interrupted", "spawn_failed")
 TERMINATION_GRACE_SECONDS = 5.0
 DEFAULT_MAX_PARALLEL_WORKERS = 32
+MAX_DEFERRED_STDOUT_BYTES = 1024 * 1024
 
 
 class ScheduleError(Exception):
@@ -689,6 +691,84 @@ class LogWriter:
         self.lock = threading.Lock()
         self.stdout_broken = False
         self.last_byte = b""
+        self.stdout_deferred = False
+        self.stdout_fd: Optional[int] = None
+        self.stdout_flags: Optional[int] = None
+        self.pending_stdout: deque[bytearray] = deque()
+        self.pending_stdout_bytes = 0
+
+    @contextmanager
+    def defer_stdout(self) -> Iterator[None]:
+        self._start_deferred_stdout()
+        try:
+            yield
+        finally:
+            self.flush_stdout()
+            self._stop_deferred_stdout()
+
+    def _start_deferred_stdout(self) -> None:
+        if not self.foreground or self.stdout_broken or self.stdout_deferred:
+            return
+        try:
+            descriptor = sys.stdout.fileno()
+            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+            fcntl.fcntl(descriptor, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        except (OSError, ValueError):
+            self.stdout_broken = True
+            return
+        self.stdout_fd = descriptor
+        self.stdout_flags = flags
+        self.stdout_deferred = True
+
+    def _stop_deferred_stdout(self) -> None:
+        with self.lock:
+            descriptor = self.stdout_fd
+            flags = self.stdout_flags
+            self.stdout_deferred = False
+            self.stdout_fd = None
+            self.stdout_flags = None
+            self.pending_stdout.clear()
+            self.pending_stdout_bytes = 0
+        if descriptor is not None and flags is not None:
+            try:
+                fcntl.fcntl(descriptor, fcntl.F_SETFL, flags)
+            except OSError:
+                pass
+
+    def flush_stdout(self) -> None:
+        """Flush deferred foreground output without waiting for its reader."""
+        while True:
+            with self.lock:
+                if (
+                    not self.stdout_deferred
+                    or self.stdout_broken
+                    or not self.pending_stdout
+                    or self.stdout_fd is None
+                ):
+                    return
+                descriptor = self.stdout_fd
+                chunk = self.pending_stdout[0]
+            try:
+                written = os.write(descriptor, chunk)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                with self.lock:
+                    self.stdout_broken = True
+                    self.pending_stdout.clear()
+                    self.pending_stdout_bytes = 0
+                return
+            if written <= 0:
+                with self.lock:
+                    self.stdout_broken = True
+                    self.pending_stdout.clear()
+                    self.pending_stdout_bytes = 0
+                return
+            with self.lock:
+                del chunk[:written]
+                self.pending_stdout_bytes -= written
+                if not chunk:
+                    self.pending_stdout.popleft()
 
     def write(self, data: bytes) -> None:
         with self.lock:
@@ -704,10 +784,18 @@ class LogWriter:
                 remaining = remaining[written:]
             self.file.flush()
             if self.foreground and not self.stdout_broken:
-                try:
-                    write_all_fd(sys.stdout.fileno(), data)
-                except OSError:
-                    self.stdout_broken = True
+                if self.stdout_deferred:
+                    self.pending_stdout.append(bytearray(data))
+                    self.pending_stdout_bytes += len(data)
+                    if self.pending_stdout_bytes > MAX_DEFERRED_STDOUT_BYTES:
+                        self.stdout_broken = True
+                        self.pending_stdout.clear()
+                        self.pending_stdout_bytes = 0
+                else:
+                    try:
+                        write_all_fd(sys.stdout.fileno(), data)
+                    except OSError:
+                        self.stdout_broken = True
 
     def line(self, text: str = "") -> None:
         self.write((text + "\n").encode("utf-8", errors="replace"))
@@ -1068,7 +1156,9 @@ def run_parallel_item(
 
 
 def wait_for_parallel_items(
-    futures: Sequence[Future[Optional[int]]], signal_relay: WorkerSignalRelay
+    futures: Sequence[Future[Optional[int]]],
+    signal_relay: WorkerSignalRelay,
+    writer: Optional[LogWriter] = None,
 ) -> Optional[int]:
     """Wait for all parallel commands, escalating a termination when needed."""
     interruption_signal: Optional[int] = None
@@ -1091,6 +1181,8 @@ def wait_for_parallel_items(
 
     while True:
         try:
+            if writer is not None:
+                writer.flush_stdout()
             if interruption_signal is None and signal_relay.received is not None:
                 request_stop(signal_relay.received)
             if all(future.done() for future in futures):
@@ -1191,7 +1283,7 @@ def run_parallel_items(
             safe_log_line(
                 writer, f"schedule: could not schedule parallel commands: {submission_error}"
             )
-        interruption_signal = wait_for_parallel_items(futures, parallel_relay)
+        interruption_signal = wait_for_parallel_items(futures, parallel_relay, writer)
     except BaseException as error:
         if worker_error is None:
             worker_error = error
@@ -1282,30 +1374,31 @@ def run_worker(
                 )
             )
             if parallel:
-                if signal_relay is None:
-                    with WorkerSignalRelay() as foreground_signal_relay:
-                        return run_parallel_items(
-                            state,
-                            connection,
-                            run_id,
-                            run,
-                            items,
-                            fish_path,
-                            foreground,
-                            writer,
-                            foreground_signal_relay,
-                        )
-                return run_parallel_items(
-                    state,
-                    connection,
-                    run_id,
-                    run,
-                    items,
-                    fish_path,
-                    foreground,
-                    writer,
-                    signal_relay,
-                )
+                with writer.defer_stdout():
+                    if signal_relay is None:
+                        with WorkerSignalRelay() as foreground_signal_relay:
+                            return run_parallel_items(
+                                state,
+                                connection,
+                                run_id,
+                                run,
+                                items,
+                                fish_path,
+                                foreground,
+                                writer,
+                                foreground_signal_relay,
+                            )
+                    return run_parallel_items(
+                        state,
+                        connection,
+                        run_id,
+                        run,
+                        items,
+                        fish_path,
+                        foreground,
+                        writer,
+                        signal_relay,
+                    )
             attempted = 0
             failures = 0
             interruption_signal: Optional[int] = None

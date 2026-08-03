@@ -193,6 +193,42 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("✗ interrupted", stdout)
         self.assertIn("Queue is empty", self.cli("list").stdout)
 
+    def test_parallel_foreground_interrupts_when_stdout_reader_stops(self) -> None:
+        self.add("yes x | head -c 1000000; sleep 30")
+        process = subprocess.Popen(
+            [str(SCHEDULE), "run", "--parallel"],
+            cwd=self.work,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            running = False
+            while time.monotonic() < deadline:
+                if (self.state / "schedule.db").exists():
+                    connection = self.database()
+                    try:
+                        row = connection.execute(
+                            "SELECT status FROM runs ORDER BY id DESC LIMIT 1"
+                        ).fetchone()
+                    finally:
+                        connection.close()
+                    if row is not None and row["status"] == "running":
+                        running = True
+                        break
+                time.sleep(0.05)
+            self.assertTrue(running, "parallel run did not start")
+            process.send_signal(signal.SIGINT)
+            process.wait(timeout=10)
+            stdout, stderr = process.communicate(timeout=2)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+        self.assertEqual(process.returncode, 130, stderr)
+
     def test_parallel_foreground_preserves_sigtstp_job_control(self) -> None:
         first_started = self.work / "sigtstp-first-started"
         second_started = self.work / "sigtstp-second-started"
