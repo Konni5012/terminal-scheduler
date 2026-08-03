@@ -345,7 +345,10 @@ class WorkerSignalRelay:
 
     def _handle_suspend(self, _signal_number: int, _frame: object) -> None:
         """Stop child groups, then let the scheduler undergo normal job control."""
-        self._forward(signal.SIGTSTP)
+        # These groups are separate sessions and may be orphaned, so POSIX can
+        # discard SIGTSTP for them. SIGSTOP guarantees that every command
+        # pauses before the scheduler enters its own job-control stop.
+        self._forward(signal.SIGSTOP)
         # SIGTSTP is blocked while its Python handler runs. SIGSTOP gives the
         # scheduler the same stop/resume behavior without recursively queueing
         # another SIGTSTP before this handler returns.

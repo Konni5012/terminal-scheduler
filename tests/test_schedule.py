@@ -218,7 +218,7 @@ class ScheduleTests(unittest.TestCase):
                 time.sleep(0.05)
             self.assertTrue(started, "parallel commands did not start")
             process.send_signal(signal.SIGTSTP)
-            time.sleep(0.25)
+            time.sleep(1.25)
             self.assertIsNone(process.poll(), "Ctrl-Z terminated the scheduler")
             self.assertFalse(first_finished.exists())
             self.assertFalse(second_finished.exists())
