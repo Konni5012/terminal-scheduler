@@ -229,6 +229,14 @@ class ScheduleTests(unittest.TestCase):
 
         self.assertEqual(process.returncode, 130, stderr)
 
+    def test_parallel_foreground_drains_large_output(self) -> None:
+        self.add("yes x | head -c 2097152")
+        result = self.cli("run", "--parallel", timeout=20)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(len(result.stdout), 2097152)
+        self.assertIn("✓ succeeded", result.stdout)
+
     def test_parallel_foreground_preserves_sigtstp_job_control(self) -> None:
         first_started = self.work / "sigtstp-first-started"
         second_started = self.work / "sigtstp-second-started"

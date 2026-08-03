@@ -34,6 +34,7 @@ FINISHED_STATUSES = ("succeeded", "failed", "interrupted", "spawn_failed")
 TERMINATION_GRACE_SECONDS = 5.0
 DEFAULT_MAX_PARALLEL_WORKERS = 32
 MAX_DEFERRED_STDOUT_BYTES = 1024 * 1024
+STDOUT_SPOOL_COPY_BYTES = 64 * 1024
 
 
 class ScheduleError(Exception):
@@ -305,6 +306,7 @@ class WorkerSignalRelay:
         self.lock = threading.RLock()
         self.process_start_lock = threading.RLock()
         self.received: Optional[int] = None
+        self.raise_worker_termination = True
         self.suspended = False
         self.previous_handlers: dict[int, object] = {}
 
@@ -346,7 +348,7 @@ class WorkerSignalRelay:
             received = self.received
             has_processes = bool(self.processes)
         self._forward(signal_number)
-        if has_processes:
+        if has_processes and self.raise_worker_termination:
             raise WorkerTermination(received)
 
     def _handle_continue(self, _signal_number: int, _frame: object) -> None:
@@ -735,6 +737,44 @@ class LogWriter:
         if spool is not None:
             spool.close()
 
+    def _compact_stdout_spool_locked(self) -> None:
+        assert self.stdout_spool is not None
+        old_spool = self.stdout_spool
+        consumed = self.stdout_spool_read_offset
+        old_spool.seek(consumed)
+        new_spool = tempfile.SpooledTemporaryFile(
+            max_size=MAX_DEFERRED_STDOUT_BYTES, mode="w+b"
+        )
+        try:
+            while True:
+                data = old_spool.read(STDOUT_SPOOL_COPY_BYTES)
+                if not data:
+                    break
+                new_spool.write(data)
+            new_spool.flush()
+        except BaseException:
+            new_spool.close()
+            return
+        old_spool.close()
+        self.stdout_spool = new_spool
+        self.stdout_spool_read_offset = 0
+        self.stdout_spool_write_offset -= consumed
+
+    def _maybe_compact_stdout_spool_locked(self) -> None:
+        if self.stdout_spool is None:
+            return
+        if self.stdout_spool_read_offset == self.stdout_spool_write_offset:
+            self.stdout_spool.seek(0)
+            self.stdout_spool.truncate()
+            self.stdout_spool.flush()
+            self.stdout_spool_read_offset = 0
+            self.stdout_spool_write_offset = 0
+        elif (
+            self.stdout_spool_read_offset >= MAX_DEFERRED_STDOUT_BYTES
+            and self.stdout_spool_read_offset >= self.stdout_spool_write_offset // 2
+        ):
+            self._compact_stdout_spool_locked()
+
     def flush_stdout(
         self,
         wait: bool = False,
@@ -794,6 +834,7 @@ class LogWriter:
                 del chunk[:written]
                 if not chunk:
                     self.pending_stdout = None
+                self._maybe_compact_stdout_spool_locked()
 
     def write(self, data: bytes) -> None:
         with self.lock:
@@ -815,6 +856,7 @@ class LogWriter:
                     self.stdout_spool.write(data)
                     self.stdout_spool.flush()
                     self.stdout_spool_write_offset += len(data)
+                    self._maybe_compact_stdout_spool_locked()
                 else:
                     try:
                         write_all_fd(sys.stdout.fileno(), data)
@@ -1269,6 +1311,10 @@ def run_parallel_items(
     signal_relay: Optional[WorkerSignalRelay],
 ) -> int:
     parallel_relay = signal_relay or WorkerSignalRelay()
+    # The wait loop polls this relay and owns escalation. Keeping signal
+    # handlers non-raising makes submission and executor cleanup atomic from
+    # the scheduler's point of view.
+    parallel_relay.raise_worker_termination = False
 
     executor = ThreadPoolExecutor(
         max_workers=parallel_worker_limit(len(items)), thread_name_prefix="schedule"
@@ -1279,42 +1325,52 @@ def run_parallel_items(
     interruption_signal: Optional[int] = None
     worker_error: Optional[BaseException] = None
     try:
-        for item in items:
-            if parallel_relay.received is not None:
-                submission_signal = parallel_relay.received
-                break
-            try:
-                futures.append(
-                    executor.submit(
-                        run_parallel_item,
-                        state,
-                        run_id,
-                        item,
-                        fish_path,
-                        foreground,
-                        writer,
-                        parallel_relay,
+        try:
+            for item in items:
+                if parallel_relay.received is not None:
+                    submission_signal = parallel_relay.received
+                    break
+                try:
+                    futures.append(
+                        executor.submit(
+                            run_parallel_item,
+                            state,
+                            run_id,
+                            item,
+                            fish_path,
+                            foreground,
+                            writer,
+                            parallel_relay,
+                        )
                     )
-                )
-            except WorkerTermination as termination:
-                submission_signal = termination.signal_number
-                break
-            except KeyboardInterrupt:
-                submission_signal = signal.SIGINT
-                break
-            except RuntimeError as error:
-                submission_error = error
+                except WorkerTermination as termination:
+                    submission_signal = termination.signal_number
+                    break
+                except KeyboardInterrupt:
+                    submission_signal = signal.SIGINT
+                    break
+                except RuntimeError as error:
+                    submission_error = error
+                    worker_error = error
+                    break
+        except WorkerTermination as termination:
+            submission_signal = termination.signal_number
+        except KeyboardInterrupt:
+            submission_signal = signal.SIGINT
+        except BaseException as error:
+            if worker_error is None:
                 worker_error = error
-                break
+
         if submission_signal is not None:
             parallel_relay.request_stop(submission_signal)
         if submission_error is not None:
-            # Stop already-running commands and cancel queued futures, but
-            # keep the executor failure separate from an external signal.
-            parallel_relay.request_stop(signal.SIGTERM)
             safe_log_line(
                 writer, f"schedule: could not schedule parallel commands: {submission_error}"
             )
+        if worker_error is not None:
+            # Stop already-running commands and let the wait loop escalate
+            # while preserving the scheduling error as a failed run.
+            parallel_relay.request_stop(signal.SIGTERM)
         interruption_signal = wait_for_parallel_items(futures, parallel_relay, writer)
     except BaseException as error:
         if worker_error is None:
