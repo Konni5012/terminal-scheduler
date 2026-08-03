@@ -300,8 +300,9 @@ class WorkerSignalRelay:
 
     def __init__(self) -> None:
         self.processes: dict[int, subprocess.Popen[bytes]] = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.received: Optional[int] = None
+        self.suspended = False
         self.previous_handlers: dict[int, object] = {}
 
     def __enter__(self) -> "WorkerSignalRelay":
@@ -341,6 +342,8 @@ class WorkerSignalRelay:
             raise WorkerTermination(received)
 
     def _handle_continue(self, _signal_number: int, _frame: object) -> None:
+        with self.lock:
+            self.suspended = False
         self._forward(signal.SIGCONT)
 
     def _handle_suspend(self, _signal_number: int, _frame: object) -> None:
@@ -348,6 +351,8 @@ class WorkerSignalRelay:
         # These groups are separate sessions and may be orphaned, so POSIX can
         # discard SIGTSTP for them. SIGSTOP guarantees that every command
         # pauses before the scheduler enters its own job-control stop.
+        with self.lock:
+            self.suspended = True
         self._forward(signal.SIGSTOP)
         # SIGTSTP is blocked while its Python handler runs. SIGSTOP gives the
         # scheduler the same stop/resume behavior without recursively queueing
@@ -373,12 +378,25 @@ class WorkerSignalRelay:
         with self.lock:
             self.processes[process.pid] = process
             received = self.received
+            suspended = self.suspended
         if received is not None:
             try:
                 os.killpg(process.pid, received)
             except OSError:
                 pass
             raise WorkerTermination(received)
+        if suspended:
+            try:
+                os.killpg(process.pid, signal.SIGSTOP)
+            except OSError:
+                return
+            with self.lock:
+                resumed = not self.suspended
+            if resumed:
+                try:
+                    os.killpg(process.pid, signal.SIGCONT)
+                except OSError:
+                    pass
 
     def detach(self, process: subprocess.Popen[bytes]) -> None:
         with self.lock:
@@ -772,14 +790,14 @@ def stop_command_group(
     for signal_number in dict.fromkeys((initial_signal, signal.SIGTERM)):
         try:
             os.killpg(process.pid, signal_number)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             break
         if wait_for_command_group(process, writer, TERMINATION_GRACE_SECONDS):
             break
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         wait_for_command_group(process, writer, TERMINATION_GRACE_SECONDS)
 
