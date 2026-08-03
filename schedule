@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import unicodedata
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from typing import BinaryIO, Iterable, Iterator, Optional, Protocol, Sequence
 import uuid
@@ -301,9 +301,15 @@ class WorkerSignalRelay:
     def __init__(self) -> None:
         self.processes: dict[int, subprocess.Popen[bytes]] = {}
         self.lock = threading.RLock()
+        self.process_start_lock = threading.Lock()
         self.received: Optional[int] = None
         self.suspended = False
         self.previous_handlers: dict[int, object] = {}
+
+    @contextmanager
+    def process_start(self) -> Iterator[None]:
+        with self.process_start_lock:
+            yield
 
     def __enter__(self) -> "WorkerSignalRelay":
         for signal_name in (
@@ -351,13 +357,14 @@ class WorkerSignalRelay:
         # These groups are separate sessions and may be orphaned, so POSIX can
         # discard SIGTSTP for them. SIGSTOP guarantees that every command
         # pauses before the scheduler enters its own job-control stop.
-        with self.lock:
-            self.suspended = True
-        self._forward(signal.SIGSTOP)
-        # SIGTSTP is blocked while its Python handler runs. SIGSTOP gives the
-        # scheduler the same stop/resume behavior without recursively queueing
-        # another SIGTSTP before this handler returns.
-        os.kill(os.getpid(), signal.SIGSTOP)
+        with self.process_start_lock:
+            with self.lock:
+                self.suspended = True
+            self._forward(signal.SIGSTOP)
+            # SIGTSTP is blocked while its Python handler runs. SIGSTOP gives
+            # the scheduler the same stop/resume behavior without recursively
+            # queueing another SIGTSTP before this handler returns.
+            os.kill(os.getpid(), signal.SIGSTOP)
 
     def _forward(self, signal_number: int) -> None:
         with self.lock:
@@ -834,28 +841,29 @@ def command_result(
     separate_process_group: bool = False,
 ) -> tuple[int, Optional[int]]:
     try:
-        process = subprocess.Popen(
-            [fish_path, "-c", command],
-            cwd=cwd,
-            stdin=None if foreground else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-            close_fds=True,
-            start_new_session=not foreground or separate_process_group,
-        )
+        start_context = signal_relay.process_start() if signal_relay is not None else nullcontext()
+        with start_context:
+            process = subprocess.Popen(
+                [fish_path, "-c", command],
+                cwd=cwd,
+                stdin=None if foreground else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+                close_fds=True,
+                start_new_session=not foreground or separate_process_group,
+            )
+            if signal_relay is not None:
+                signal_relay.attach(process)
     except OSError as error:
         writer.line(f"schedule: could not start command: {error}")
         return 127, None
-
-    interruption_signal: Optional[int] = None
-    if signal_relay is not None:
-        try:
-            signal_relay.attach(process)
-        except WorkerTermination as termination:
-            signal_relay.detach(process)
-            interruption_signal = termination.signal_number
-            return_code = stop_command_group(process, writer, interruption_signal)
+    except WorkerTermination as termination:
+        signal_relay.detach(process)
+        interruption_signal = termination.signal_number
+        return_code = stop_command_group(process, writer, interruption_signal)
+    else:
+        interruption_signal = None
     assert process.stdout is not None
     try:
         if interruption_signal is None:
