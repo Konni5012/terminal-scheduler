@@ -304,7 +304,7 @@ class WorkerSignalRelay:
         self.previous_handlers: dict[int, object] = {}
 
     def __enter__(self) -> "WorkerSignalRelay":
-        for signal_name in ("SIGTERM", "SIGHUP"):
+        for signal_name in ("SIGTERM", "SIGHUP", "SIGQUIT"):
             signal_number = getattr(signal, signal_name, None)
             if signal_number is None:
                 continue
@@ -1052,6 +1052,19 @@ def run_worker(
                 )
             )
             if parallel:
+                if signal_relay is None:
+                    with WorkerSignalRelay() as foreground_signal_relay:
+                        return run_parallel_items(
+                            state,
+                            connection,
+                            run_id,
+                            run,
+                            items,
+                            fish_path,
+                            foreground,
+                            writer,
+                            foreground_signal_relay,
+                        )
                 return run_parallel_items(
                     state,
                     connection,

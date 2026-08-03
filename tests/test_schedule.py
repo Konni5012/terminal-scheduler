@@ -154,6 +154,45 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("✓ succeeded · 2 commands", result.stdout)
         self.assertIn("Queue is empty", self.cli("list").stdout)
 
+    def test_parallel_foreground_forwards_sigquit_to_commands(self) -> None:
+        self.add("sleep 30")
+        self.add("sleep 30")
+        process = subprocess.Popen(
+            [str(SCHEDULE), "run", "--parralel"],
+            cwd=self.work,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            running = False
+            while time.monotonic() < deadline:
+                if (self.state / "schedule.db").exists():
+                    connection = self.database()
+                    try:
+                        row = connection.execute(
+                            "SELECT status FROM runs ORDER BY id DESC LIMIT 1"
+                        ).fetchone()
+                    finally:
+                        connection.close()
+                    if row is not None and row["status"] == "running":
+                        running = True
+                        break
+                time.sleep(0.05)
+            self.assertTrue(running, "parallel run did not start")
+            process.send_signal(signal.SIGQUIT)
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+        self.assertEqual(process.returncode, 131, stderr)
+        self.assertIn("✗ interrupted", stdout)
+        self.assertIn("Queue is empty", self.cli("list").stdout)
+
     def test_parallel_run_attempts_all_commands_and_reports_failures(self) -> None:
         self.add("echo parallel-failed; false")
         self.add("sleep 0.1; echo parallel-continued")
