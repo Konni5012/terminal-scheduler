@@ -766,17 +766,25 @@ class LogWriter:
         if queue is None or descriptor is None:
             return
         while True:
-            try:
-                data = queue.get(timeout=0.05)
-            except Empty:
+            with self.lock:
+                try:
+                    data = queue.get_nowait()
+                except Empty:
+                    data = None
+                    has_data = False
+                else:
+                    self.stdout_forwarder_busy = True
+                    has_data = True
+            if not has_data:
                 if stop.is_set():
                     return
+                stop.wait(0.05)
                 continue
             if data is None:
                 queue.task_done()
+                with self.lock:
+                    self.stdout_forwarder_busy = False
                 return
-            with self.lock:
-                self.stdout_forwarder_busy = True
             try:
                 write_all_fd(descriptor, data)
             except BaseException:
@@ -784,9 +792,9 @@ class LogWriter:
                     self.stdout_broken = True
                 return
             finally:
+                queue.task_done()
                 with self.lock:
                     self.stdout_forwarder_busy = False
-                queue.task_done()
 
     def _stop_deferred_stdout(self) -> None:
         with self.lock:
