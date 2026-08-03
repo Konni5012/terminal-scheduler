@@ -1228,6 +1228,7 @@ def run_parallel_item(
     connection: Optional[sqlite3.Connection] = None
     item_interruption_signal: Optional[int] = None
     item_recorded = False
+    launch_attempted = False
     try:
         connection = state.connect()
         started_at = utc_now()
@@ -1238,6 +1239,7 @@ def run_parallel_item(
                 (started_at, run_id, item_id),
             )
         item_writer.line(f"[{item_id}] {terminal_text(str(item['command']).strip())}")
+        launch_attempted = True
         exit_code, item_interruption_signal = command_result(
             item_writer,
             fish_path,
@@ -1276,6 +1278,8 @@ def run_parallel_item(
     except WorkerTermination:
         raise
     except BaseException as error:
+        if not launch_attempted:
+            raise
         message = f"parallel command {item_id} failed: {error}"
         if not item_recorded:
             record_parallel_item_failure(state, run_id, item_id, message)
@@ -1569,15 +1573,15 @@ def run_worker(
         descriptor = os.open(log_path, os.O_WRONLY | os.O_APPEND)
         with os.fdopen(descriptor, "ab", buffering=0) as log_file:
             writer = LogWriter(log_file, foreground)
-            writer.line(f"run {run_id} · {run['mode']}")
-            items = list(
-                connection.execute(
-                    "SELECT * FROM run_items WHERE run_id = ? ORDER BY sequence",
-                    (run_id,),
-                )
-            )
             if parallel:
                 with writer.defer_stdout():
+                    writer.line(f"run {run_id} · {run['mode']}")
+                    items = list(
+                        connection.execute(
+                            "SELECT * FROM run_items WHERE run_id = ? ORDER BY sequence",
+                            (run_id,),
+                        )
+                    )
                     if signal_relay is None:
                         with WorkerSignalRelay() as foreground_signal_relay:
                             return run_parallel_items(
@@ -1602,6 +1606,13 @@ def run_worker(
                         writer,
                         signal_relay,
                     )
+            writer.line(f"run {run_id} · {run['mode']}")
+            items = list(
+                connection.execute(
+                    "SELECT * FROM run_items WHERE run_id = ? ORDER BY sequence",
+                    (run_id,),
+                )
+            )
             attempted = 0
             failures = 0
             interruption_signal: Optional[int] = None
