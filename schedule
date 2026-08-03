@@ -304,7 +304,7 @@ class WorkerSignalRelay:
         self.previous_handlers: dict[int, object] = {}
 
     def __enter__(self) -> "WorkerSignalRelay":
-        for signal_name in ("SIGTERM", "SIGHUP", "SIGQUIT"):
+        for signal_name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"):
             signal_number = getattr(signal, signal_name, None)
             if signal_number is None:
                 continue
@@ -896,7 +896,7 @@ def wait_for_parallel_items(
     futures: Sequence[Future[Optional[int]]], signal_relay: WorkerSignalRelay
 ) -> Optional[int]:
     """Wait for all parallel commands, escalating a termination when needed."""
-    interruption_signal = signal_relay.received
+    interruption_signal: Optional[int] = None
     stop_signal: Optional[int] = None
     escalation = 0
     deadline: Optional[float] = None
@@ -961,20 +961,30 @@ def run_parallel_items(
 
     executor = ThreadPoolExecutor(max_workers=len(items), thread_name_prefix="schedule")
     futures: list[Future[Optional[int]]] = []
+    submission_signal: Optional[int] = None
     try:
-        futures = [
-            executor.submit(
-                run_parallel_item,
-                state,
-                run_id,
-                item,
-                fish_path,
-                foreground,
-                writer,
-                parallel_relay,
-            )
-            for item in items
-        ]
+        for item in items:
+            try:
+                futures.append(
+                    executor.submit(
+                        run_parallel_item,
+                        state,
+                        run_id,
+                        item,
+                        fish_path,
+                        foreground,
+                        writer,
+                        parallel_relay,
+                    )
+                )
+            except WorkerTermination as termination:
+                submission_signal = termination.signal_number
+                break
+            except KeyboardInterrupt:
+                submission_signal = signal.SIGINT
+                break
+        if submission_signal is not None:
+            parallel_relay.request_stop(submission_signal)
         interruption_signal = wait_for_parallel_items(futures, parallel_relay)
     finally:
         executor.shutdown(wait=True)
