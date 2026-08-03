@@ -23,7 +23,7 @@ import time
 import unicodedata
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
-from typing import BinaryIO, Iterable, Iterator, Optional, Protocol, Sequence
+from typing import BinaryIO, Callable, Iterable, Iterator, Optional, Protocol, Sequence
 import uuid
 
 
@@ -33,7 +33,6 @@ ACTIVE_STATUSES = ("starting", "running")
 FINISHED_STATUSES = ("succeeded", "failed", "interrupted", "spawn_failed")
 TERMINATION_GRACE_SECONDS = 5.0
 DEFAULT_MAX_PARALLEL_WORKERS = 32
-MAX_DEFERRED_STDOUT_BYTES = 1024 * 1024
 
 
 class ScheduleError(Exception):
@@ -693,9 +692,7 @@ class LogWriter:
         self.last_byte = b""
         self.stdout_deferred = False
         self.stdout_fd: Optional[int] = None
-        self.stdout_flags: Optional[int] = None
         self.pending_stdout: deque[bytearray] = deque()
-        self.pending_stdout_bytes = 0
 
     @contextmanager
     def defer_stdout(self) -> Iterator[None]:
@@ -703,7 +700,6 @@ class LogWriter:
         try:
             yield
         finally:
-            self.flush_stdout()
             self._stop_deferred_stdout()
 
     def _start_deferred_stdout(self) -> None:
@@ -711,32 +707,24 @@ class LogWriter:
             return
         try:
             descriptor = sys.stdout.fileno()
-            flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
-            fcntl.fcntl(descriptor, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         except (OSError, ValueError):
             self.stdout_broken = True
             return
         self.stdout_fd = descriptor
-        self.stdout_flags = flags
         self.stdout_deferred = True
 
     def _stop_deferred_stdout(self) -> None:
         with self.lock:
-            descriptor = self.stdout_fd
-            flags = self.stdout_flags
             self.stdout_deferred = False
             self.stdout_fd = None
-            self.stdout_flags = None
             self.pending_stdout.clear()
-            self.pending_stdout_bytes = 0
-        if descriptor is not None and flags is not None:
-            try:
-                fcntl.fcntl(descriptor, fcntl.F_SETFL, flags)
-            except OSError:
-                pass
 
-    def flush_stdout(self) -> None:
-        """Flush deferred foreground output without waiting for its reader."""
+    def flush_stdout(
+        self,
+        wait: bool = False,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """Flush deferred output without making worker threads perform I/O."""
         while True:
             with self.lock:
                 if (
@@ -745,28 +733,40 @@ class LogWriter:
                     or not self.pending_stdout
                     or self.stdout_fd is None
                 ):
-                    return
+                    return not self.pending_stdout
                 descriptor = self.stdout_fd
                 chunk = self.pending_stdout[0]
             try:
-                written = os.write(descriptor, chunk)
-            except (BlockingIOError, InterruptedError):
-                return
+                stopping = should_stop is not None and should_stop()
+                timeout = 0.0 if stopping or not wait else 0.05
+                _, writable, _ = select.select([], [descriptor], [], timeout)
+            except InterruptedError:
+                continue
+            except (OSError, ValueError):
+                with self.lock:
+                    self.stdout_broken = True
+                    self.pending_stdout.clear()
+                return False
+            if not writable:
+                return False
+            try:
+                written = os.write(descriptor, chunk[:4096])
+            except BlockingIOError:
+                return False
+            except InterruptedError:
+                continue
             except OSError:
                 with self.lock:
                     self.stdout_broken = True
                     self.pending_stdout.clear()
-                    self.pending_stdout_bytes = 0
-                return
+                return False
             if written <= 0:
                 with self.lock:
                     self.stdout_broken = True
                     self.pending_stdout.clear()
-                    self.pending_stdout_bytes = 0
-                return
+                return False
             with self.lock:
                 del chunk[:written]
-                self.pending_stdout_bytes -= written
                 if not chunk:
                     self.pending_stdout.popleft()
 
@@ -786,11 +786,6 @@ class LogWriter:
             if self.foreground and not self.stdout_broken:
                 if self.stdout_deferred:
                     self.pending_stdout.append(bytearray(data))
-                    self.pending_stdout_bytes += len(data)
-                    if self.pending_stdout_bytes > MAX_DEFERRED_STDOUT_BYTES:
-                        self.stdout_broken = True
-                        self.pending_stdout.clear()
-                        self.pending_stdout_bytes = 0
                 else:
                     try:
                         write_all_fd(sys.stdout.fileno(), data)
@@ -1333,6 +1328,9 @@ def run_parallel_items(
             failures,
             overall_exit,
         )
+    )
+    writer.flush_stdout(
+        wait=True, should_stop=lambda: parallel_relay.received is not None
     )
     return overall_exit
 
