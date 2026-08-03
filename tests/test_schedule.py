@@ -193,9 +193,13 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("✗ interrupted", stdout)
         self.assertIn("Queue is empty", self.cli("list").stdout)
 
-    def test_parallel_foreground_forwards_sigtstp_to_commands(self) -> None:
-        self.add("sleep 30")
-        self.add("sleep 30")
+    def test_parallel_foreground_preserves_sigtstp_job_control(self) -> None:
+        first_started = self.work / "sigtstp-first-started"
+        second_started = self.work / "sigtstp-second-started"
+        first_finished = self.work / "sigtstp-first-finished"
+        second_finished = self.work / "sigtstp-second-finished"
+        self.add(f"touch {first_started}; sleep 1; touch {first_finished}")
+        self.add(f"touch {second_started}; sleep 1; touch {second_finished}")
         process = subprocess.Popen(
             [str(SCHEDULE), "run", "--parallel"],
             cwd=self.work,
@@ -206,31 +210,30 @@ class ScheduleTests(unittest.TestCase):
         )
         try:
             deadline = time.monotonic() + 5
-            running = False
+            started = False
             while time.monotonic() < deadline:
-                if (self.state / "schedule.db").exists():
-                    connection = self.database()
-                    try:
-                        row = connection.execute(
-                            "SELECT status FROM runs ORDER BY id DESC LIMIT 1"
-                        ).fetchone()
-                    finally:
-                        connection.close()
-                    if row is not None and row["status"] == "running":
-                        running = True
-                        break
+                if first_started.exists() and second_started.exists():
+                    started = True
+                    break
                 time.sleep(0.05)
-            self.assertTrue(running, "parallel run did not start")
+            self.assertTrue(started, "parallel commands did not start")
             process.send_signal(signal.SIGTSTP)
+            time.sleep(0.25)
+            self.assertIsNone(process.poll(), "Ctrl-Z terminated the scheduler")
+            self.assertFalse(first_finished.exists())
+            self.assertFalse(second_finished.exists())
+            process.send_signal(signal.SIGCONT)
             stdout, stderr = process.communicate(timeout=10)
         finally:
             if process.poll() is None:
+                process.send_signal(signal.SIGCONT)
                 process.kill()
                 process.wait()
 
-        self.assertEqual(process.returncode, 128 + signal.SIGTSTP, stderr)
-        self.assertIn("✗ interrupted", stdout)
-        self.assertIn("Queue is empty", self.cli("list").stdout)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("✓ succeeded", stdout)
+        self.assertTrue(first_finished.exists())
+        self.assertTrue(second_finished.exists())
 
     def test_parallel_run_attempts_all_commands_and_reports_failures(self) -> None:
         self.add("echo parallel-failed; false")

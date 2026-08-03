@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 import errno
 import fcntl
 import itertools
@@ -31,6 +31,7 @@ SCHEMA_VERSION = "1"
 ACTIVE_STATUSES = ("starting", "running")
 FINISHED_STATUSES = ("succeeded", "failed", "interrupted", "spawn_failed")
 TERMINATION_GRACE_SECONDS = 5.0
+MAX_PARALLEL_WORKERS = 32
 
 
 class ScheduleError(Exception):
@@ -304,12 +305,24 @@ class WorkerSignalRelay:
         self.previous_handlers: dict[int, object] = {}
 
     def __enter__(self) -> "WorkerSignalRelay":
-        for signal_name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"):
+        for signal_name in (
+            "SIGINT",
+            "SIGTERM",
+            "SIGHUP",
+            "SIGQUIT",
+            "SIGCONT",
+            "SIGTSTP",
+        ):
             signal_number = getattr(signal, signal_name, None)
             if signal_number is None:
                 continue
             self.previous_handlers[signal_number] = signal.getsignal(signal_number)
-            signal.signal(signal_number, self._handle)
+            if signal_name == "SIGCONT":
+                signal.signal(signal_number, self._handle_continue)
+            elif signal_name == "SIGTSTP":
+                signal.signal(signal_number, self._handle_suspend)
+            else:
+                signal.signal(signal_number, self._handle)
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -326,6 +339,17 @@ class WorkerSignalRelay:
         self._forward(signal_number)
         if has_processes:
             raise WorkerTermination(received)
+
+    def _handle_continue(self, _signal_number: int, _frame: object) -> None:
+        self._forward(signal.SIGCONT)
+
+    def _handle_suspend(self, _signal_number: int, _frame: object) -> None:
+        """Stop child groups, then let the scheduler undergo normal job control."""
+        self._forward(signal.SIGTSTP)
+        # SIGTSTP is blocked while its Python handler runs. SIGSTOP gives the
+        # scheduler the same stop/resume behavior without recursively queueing
+        # another SIGTSTP before this handler returns.
+        os.kill(os.getpid(), signal.SIGSTOP)
 
     def _forward(self, signal_number: int) -> None:
         with self.lock:
@@ -910,6 +934,8 @@ def wait_for_parallel_items(
             escalation = 1
             deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
             signal_relay.request_stop(signal_number)
+            for future in futures:
+                future.cancel()
 
     while True:
         try:
@@ -934,10 +960,14 @@ def wait_for_parallel_items(
                 deadline = None
 
     for future in futures:
+        if future.cancelled():
+            continue
         try:
             item_interruption_signal = future.result()
         except WorkerTermination as termination:
             request_stop(termination.signal_number)
+            continue
+        except CancelledError:
             continue
         if interruption_signal is None and item_interruption_signal is not None:
             interruption_signal = item_interruption_signal
@@ -959,9 +989,12 @@ def run_parallel_items(
     for item in items:
         writer.line(f"[{int(item['queue_id'])}] {terminal_text(str(item['command']).strip())}")
 
-    executor = ThreadPoolExecutor(max_workers=len(items), thread_name_prefix="schedule")
+    executor = ThreadPoolExecutor(
+        max_workers=min(len(items), MAX_PARALLEL_WORKERS), thread_name_prefix="schedule"
+    )
     futures: list[Future[Optional[int]]] = []
     submission_signal: Optional[int] = None
+    submission_error: Optional[str] = None
     try:
         for item in items:
             if parallel_relay.received is not None:
@@ -986,11 +1019,17 @@ def run_parallel_items(
             except KeyboardInterrupt:
                 submission_signal = signal.SIGINT
                 break
+            except RuntimeError as error:
+                submission_error = str(error)
+                submission_signal = signal.SIGTERM
+                break
         if submission_signal is not None:
             parallel_relay.request_stop(submission_signal)
+        if submission_error is not None:
+            writer.line(f"schedule: could not schedule parallel commands: {submission_error}")
         interruption_signal = wait_for_parallel_items(futures, parallel_relay)
     finally:
-        executor.shutdown(wait=True)
+        executor.shutdown(wait=True, cancel_futures=parallel_relay.received is not None)
 
     progress = connection.execute(
         "SELECT attempted, failures FROM runs WHERE id = ?", (run_id,)
