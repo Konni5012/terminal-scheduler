@@ -31,7 +31,7 @@ SCHEMA_VERSION = "1"
 ACTIVE_STATUSES = ("starting", "running")
 FINISHED_STATUSES = ("succeeded", "failed", "interrupted", "spawn_failed")
 TERMINATION_GRACE_SECONDS = 5.0
-MAX_PARALLEL_WORKERS = 32
+DEFAULT_MAX_PARALLEL_WORKERS = 32
 
 
 class ScheduleError(Exception):
@@ -402,6 +402,21 @@ def resolved_fish() -> str:
     if not fish:
         raise ScheduleError("Fish was not found in PATH")
     return str(Path(fish).resolve())
+
+
+def parallel_worker_limit(item_count: int) -> int:
+    configured = os.environ.get("SCHEDULE_MAX_PARALLEL")
+    if configured is None:
+        return min(item_count, DEFAULT_MAX_PARALLEL_WORKERS)
+    try:
+        limit = int(configured)
+    except ValueError as error:
+        raise ScheduleError("SCHEDULE_MAX_PARALLEL must be a non-negative integer") from error
+    if limit < 0:
+        raise ScheduleError("SCHEDULE_MAX_PARALLEL must be a non-negative integer")
+    if limit == 0:
+        return item_count
+    return min(item_count, limit)
 
 
 def validate_command(command: str) -> None:
@@ -990,7 +1005,7 @@ def run_parallel_items(
         writer.line(f"[{int(item['queue_id'])}] {terminal_text(str(item['command']).strip())}")
 
     executor = ThreadPoolExecutor(
-        max_workers=min(len(items), MAX_PARALLEL_WORKERS), thread_name_prefix="schedule"
+        max_workers=parallel_worker_limit(len(items)), thread_name_prefix="schedule"
     )
     futures: list[Future[Optional[int]]] = []
     submission_signal: Optional[int] = None
@@ -1235,6 +1250,8 @@ def execute_run(
         raise ScheduleError(active_run_message(state))
     try:
         fish_path = resolved_fish()
+        if parallel:
+            parallel_worker_limit(1)
         try:
             run_id, token = create_run(
                 state,

@@ -47,7 +47,12 @@ schedule run --parralel
 
 The correctly spelled `--parallel` alias is also accepted. Parallel runs
 attempt every queued command; a failure makes the overall run fail after the
-other commands finish. Output from concurrent commands may interleave.
+other commands finish. Output from concurrent commands may interleave. To
+protect system resources, at most 32 commands run at once by default. Set
+`SCHEDULE_MAX_PARALLEL` to a positive limit, or to `0` to launch every queued
+command simultaneously. Bounded runs start later commands as slots open, so a
+command that waits for every peer to start requires a sufficiently high limit
+or `SCHEDULE_MAX_PARALLEL=0`.
 
 Continue through failures with:
 
