@@ -1151,7 +1151,7 @@ def run_parallel_items(
     )
     futures: list[Future[Optional[int]]] = []
     submission_signal: Optional[int] = None
-    submission_error: Optional[str] = None
+    submission_error: Optional[RuntimeError] = None
     interruption_signal: Optional[int] = None
     worker_error: Optional[BaseException] = None
     try:
@@ -1179,18 +1179,22 @@ def run_parallel_items(
                 submission_signal = signal.SIGINT
                 break
             except RuntimeError as error:
-                submission_error = str(error)
-                submission_signal = signal.SIGTERM
+                submission_error = error
+                worker_error = error
                 break
         if submission_signal is not None:
             parallel_relay.request_stop(submission_signal)
         if submission_error is not None:
+            # Stop already-running commands and cancel queued futures, but
+            # keep the executor failure separate from an external signal.
+            parallel_relay.request_stop(signal.SIGTERM)
             safe_log_line(
                 writer, f"schedule: could not schedule parallel commands: {submission_error}"
             )
         interruption_signal = wait_for_parallel_items(futures, parallel_relay)
     except BaseException as error:
-        worker_error = error
+        if worker_error is None:
+            worker_error = error
         parallel_relay.request_stop(signal.SIGTERM)
     finally:
         executor.shutdown(wait=True, cancel_futures=parallel_relay.received is not None)
