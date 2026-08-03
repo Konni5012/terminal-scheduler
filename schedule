@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""A persistent, sequential command queue for the Fish shell."""
+"""A persistent command queue for the Fish shell."""
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import errno
 import fcntl
 import itertools
@@ -16,11 +17,12 @@ import select
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import BinaryIO, Iterable, Iterator, Optional, Sequence
+from typing import BinaryIO, Iterable, Iterator, Optional, Protocol, Sequence
 import uuid
 
 
@@ -45,6 +47,16 @@ class WorkerTermination(Exception):
     def __init__(self, signal_number: int) -> None:
         super().__init__(signal_number)
         self.signal_number = signal_number
+
+
+class OutputWriter(Protocol):
+    last_byte: bytes
+
+    def write(self, data: bytes) -> None:
+        ...
+
+    def line(self, text: str = "") -> None:
+        ...
 
 
 def utc_now() -> str:
@@ -286,7 +298,8 @@ class WorkerSignalRelay:
     """Forward worker termination signals to the active command group."""
 
     def __init__(self) -> None:
-        self.process: Optional[subprocess.Popen[bytes]] = None
+        self.processes: dict[int, subprocess.Popen[bytes]] = {}
+        self.lock = threading.Lock()
         self.received: Optional[int] = None
         self.previous_handlers: dict[int, object] = {}
 
@@ -305,29 +318,44 @@ class WorkerSignalRelay:
         self.previous_handlers.clear()
 
     def _handle(self, signal_number: int, _frame: object) -> None:
-        if self.received is None:
-            self.received = signal_number
+        with self.lock:
+            if self.received is None:
+                self.received = signal_number
+            received = self.received
+            has_processes = bool(self.processes)
         self._forward(signal_number)
-        if self.process is not None:
-            raise WorkerTermination(self.received)
+        if has_processes:
+            raise WorkerTermination(received)
 
     def _forward(self, signal_number: int) -> None:
-        if self.process is None:
-            return
-        try:
-            os.killpg(self.process.pid, signal_number)
-        except OSError:
-            pass
+        with self.lock:
+            processes = list(self.processes.values())
+        for process in processes:
+            try:
+                os.killpg(process.pid, signal_number)
+            except OSError:
+                pass
+
+    def request_stop(self, signal_number: int) -> None:
+        with self.lock:
+            if self.received is None:
+                self.received = signal_number
+        self._forward(signal_number)
 
     def attach(self, process: subprocess.Popen[bytes]) -> None:
-        self.process = process
-        if self.received is not None:
-            self._forward(self.received)
-            raise WorkerTermination(self.received)
+        with self.lock:
+            self.processes[process.pid] = process
+            received = self.received
+        if received is not None:
+            try:
+                os.killpg(process.pid, received)
+            except OSError:
+                pass
+            raise WorkerTermination(received)
 
     def detach(self, process: subprocess.Popen[bytes]) -> None:
-        if self.process is process:
-            self.process = None
+        with self.lock:
+            self.processes.pop(process.pid, None)
 
 
 def active_run_message(state: State) -> str:
@@ -591,26 +619,47 @@ class LogWriter:
     def __init__(self, file: BinaryIO, foreground: bool) -> None:
         self.file = file
         self.foreground = foreground
+        self.lock = threading.Lock()
         self.stdout_broken = False
         self.last_byte = b""
 
     def write(self, data: bytes) -> None:
+        with self.lock:
+            if data:
+                self.last_byte = data[-1:]
+            remaining = memoryview(data)
+            while remaining:
+                written = self.file.write(remaining)
+                if written is None:
+                    break
+                if written == 0:
+                    raise OSError("log write returned zero bytes")
+                remaining = remaining[written:]
+            self.file.flush()
+            if self.foreground and not self.stdout_broken:
+                try:
+                    write_all_fd(sys.stdout.fileno(), data)
+                except OSError:
+                    self.stdout_broken = True
+
+    def line(self, text: str = "") -> None:
+        self.write((text + "\n").encode("utf-8", errors="replace"))
+
+    def command(self) -> "CommandLogWriter":
+        return CommandLogWriter(self)
+
+
+class CommandLogWriter:
+    """Track line endings independently while sharing one synchronized log."""
+
+    def __init__(self, parent: LogWriter) -> None:
+        self.parent = parent
+        self.last_byte = parent.last_byte
+
+    def write(self, data: bytes) -> None:
         if data:
             self.last_byte = data[-1:]
-        remaining = memoryview(data)
-        while remaining:
-            written = self.file.write(remaining)
-            if written is None:
-                break
-            if written == 0:
-                raise OSError("log write returned zero bytes")
-            remaining = remaining[written:]
-        self.file.flush()
-        if self.foreground and not self.stdout_broken:
-            try:
-                write_all_fd(sys.stdout.fileno(), data)
-            except OSError:
-                self.stdout_broken = True
+        self.parent.write(data)
 
     def line(self, text: str = "") -> None:
         self.write((text + "\n").encode("utf-8", errors="replace"))
@@ -645,7 +694,7 @@ def command_group_exists(group_id: int) -> bool:
 
 
 def wait_for_command_group(
-    process: subprocess.Popen[bytes], writer: LogWriter, timeout: float
+    process: subprocess.Popen[bytes], writer: OutputWriter, timeout: float
 ) -> bool:
     deadline = time.monotonic() + timeout
     assert process.stdout is not None
@@ -676,7 +725,7 @@ def wait_for_command_group(
 
 
 def stop_command_group(
-    process: subprocess.Popen[bytes], writer: LogWriter, initial_signal: int
+    process: subprocess.Popen[bytes], writer: OutputWriter, initial_signal: int
 ) -> int:
     for signal_number in dict.fromkeys((initial_signal, signal.SIGTERM)):
         try:
@@ -716,12 +765,13 @@ def run_summary(
 
 
 def command_result(
-    writer: LogWriter,
+    writer: OutputWriter,
     fish_path: str,
     command: str,
     cwd: str,
     foreground: bool,
     signal_relay: Optional[WorkerSignalRelay] = None,
+    separate_process_group: bool = False,
 ) -> tuple[int, Optional[int]]:
     try:
         process = subprocess.Popen(
@@ -732,7 +782,7 @@ def command_result(
             stderr=subprocess.STDOUT,
             bufsize=0,
             close_fds=True,
-            start_new_session=not foreground,
+            start_new_session=not foreground or separate_process_group,
         )
     except OSError as error:
         writer.line(f"schedule: could not start command: {error}")
@@ -787,11 +837,190 @@ def command_result(
     return normalized_exit_code(return_code), interruption_signal
 
 
+def run_parallel_item(
+    state: State,
+    run_id: int,
+    item: sqlite3.Row,
+    fish_path: str,
+    foreground: bool,
+    writer: LogWriter,
+    signal_relay: WorkerSignalRelay,
+) -> Optional[int]:
+    item_id = int(item["queue_id"])
+    item_writer = writer.command()
+    connection = state.connect()
+    try:
+        started_at = utc_now()
+        with transaction(connection, immediate=True):
+            connection.execute(
+                "UPDATE run_items SET status = 'running', started_at = ? "
+                "WHERE run_id = ? AND queue_id = ?",
+                (started_at, run_id, item_id),
+            )
+        exit_code, item_interruption_signal = command_result(
+            item_writer,
+            fish_path,
+            str(item["command"]),
+            str(item["cwd"]),
+            foreground,
+            signal_relay,
+            separate_process_group=True,
+        )
+        failed = exit_code != 0
+        finished_at = utc_now()
+        with transaction(connection, immediate=True):
+            connection.execute(
+                """
+                UPDATE run_items
+                SET status = ?, finished_at = ?, exit_code = ?
+                WHERE run_id = ? AND queue_id = ?
+                """,
+                ("failed" if failed else "succeeded", finished_at, exit_code, run_id, item_id),
+            )
+            connection.execute("DELETE FROM queue WHERE id = ?", (item_id,))
+            connection.execute(
+                "UPDATE runs SET attempted = attempted + 1, failures = failures + ? "
+                "WHERE id = ?",
+                (int(failed), run_id),
+            )
+        if item_writer.last_byte != b"\n":
+            item_writer.line()
+        if failed:
+            item_writer.line(f"✗ exit {exit_code}")
+        return item_interruption_signal
+    finally:
+        connection.close()
+
+
+def wait_for_parallel_items(
+    futures: Sequence[Future[Optional[int]]], signal_relay: WorkerSignalRelay
+) -> Optional[int]:
+    """Wait for all parallel commands, escalating a termination when needed."""
+    interruption_signal = signal_relay.received
+    stop_signal: Optional[int] = None
+    escalation = 0
+    deadline: Optional[float] = None
+
+    def request_stop(signal_number: int) -> None:
+        nonlocal interruption_signal, stop_signal, escalation, deadline
+        if interruption_signal is None:
+            interruption_signal = signal_number
+        if stop_signal is None:
+            stop_signal = signal_number
+            escalation = 1
+            deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
+            signal_relay.request_stop(signal_number)
+
+    while True:
+        try:
+            if interruption_signal is None and signal_relay.received is not None:
+                request_stop(signal_relay.received)
+            if all(future.done() for future in futures):
+                break
+            time.sleep(0.05)
+        except WorkerTermination as termination:
+            request_stop(termination.signal_number)
+        except KeyboardInterrupt:
+            request_stop(signal.SIGINT)
+
+        if stop_signal is not None and deadline is not None and time.monotonic() >= deadline:
+            if escalation == 1 and stop_signal not in (signal.SIGTERM, signal.SIGKILL):
+                signal_relay.request_stop(signal.SIGTERM)
+                escalation = 2
+                deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
+            elif escalation in (1, 2):
+                signal_relay.request_stop(signal.SIGKILL)
+                escalation = 3
+                deadline = None
+
+    for future in futures:
+        try:
+            item_interruption_signal = future.result()
+        except WorkerTermination as termination:
+            request_stop(termination.signal_number)
+            continue
+        if interruption_signal is None and item_interruption_signal is not None:
+            interruption_signal = item_interruption_signal
+    return interruption_signal or signal_relay.received
+
+
+def run_parallel_items(
+    state: State,
+    connection: sqlite3.Connection,
+    run_id: int,
+    run: sqlite3.Row,
+    items: Sequence[sqlite3.Row],
+    fish_path: str,
+    foreground: bool,
+    writer: LogWriter,
+    signal_relay: Optional[WorkerSignalRelay],
+) -> int:
+    parallel_relay = signal_relay or WorkerSignalRelay()
+    for item in items:
+        writer.line(f"[{int(item['queue_id'])}] {terminal_text(str(item['command']).strip())}")
+
+    executor = ThreadPoolExecutor(max_workers=len(items), thread_name_prefix="schedule")
+    futures: list[Future[Optional[int]]] = []
+    try:
+        futures = [
+            executor.submit(
+                run_parallel_item,
+                state,
+                run_id,
+                item,
+                fish_path,
+                foreground,
+                writer,
+                parallel_relay,
+            )
+            for item in items
+        ]
+        interruption_signal = wait_for_parallel_items(futures, parallel_relay)
+    finally:
+        executor.shutdown(wait=True)
+
+    progress = connection.execute(
+        "SELECT attempted, failures FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    assert progress is not None
+    attempted = int(progress["attempted"])
+    failures = int(progress["failures"])
+    if interruption_signal is not None:
+        status = "interrupted"
+        overall_exit = 128 + interruption_signal
+    elif failures:
+        status = "failed"
+        overall_exit = 1
+    else:
+        status = "succeeded"
+        overall_exit = 0
+    with transaction(connection, immediate=True):
+        connection.execute(
+            """
+            UPDATE runs
+            SET status = ?, finished_at = ?, attempted = ?, failures = ?, exit_code = ?
+            WHERE id = ?
+            """,
+            (status, utc_now(), attempted, failures, overall_exit, run_id),
+        )
+    writer.line(
+        run_summary(
+            status,
+            attempted,
+            int(run["total"]),
+            failures,
+            overall_exit,
+        )
+    )
+    return overall_exit
+
+
 def run_worker(
     state: State,
     run_id: int,
     token: str,
     signal_relay: Optional[WorkerSignalRelay] = None,
+    parallel: bool = False,
 ) -> int:
     connection = state.connect()
     try:
@@ -822,6 +1051,18 @@ def run_worker(
                     (run_id,),
                 )
             )
+            if parallel:
+                return run_parallel_items(
+                    state,
+                    connection,
+                    run_id,
+                    run,
+                    items,
+                    fish_path,
+                    foreground,
+                    writer,
+                    signal_relay,
+                )
             attempted = 0
             failures = 0
             interruption_signal: Optional[int] = None
@@ -920,7 +1161,9 @@ def mark_spawn_failed(state: State, run_id: int, message: str) -> None:
         connection.close()
 
 
-def execute_run(state: State, background: bool, no_exit_on_error: bool) -> int:
+def execute_run(
+    state: State, background: bool, no_exit_on_error: bool, parallel: bool = False
+) -> int:
     lock = ActiveLock(state)
     if not lock.acquire():
         lock.release()
@@ -939,7 +1182,7 @@ def execute_run(state: State, background: bool, no_exit_on_error: bool) -> int:
             return 0
 
         if not background:
-            return run_worker(state, run_id, token)
+            return run_worker(state, run_id, token, parallel=parallel)
 
         assert lock.fd is not None
         command = [
@@ -950,6 +1193,7 @@ def execute_run(state: State, background: bool, no_exit_on_error: bool) -> int:
             token,
             str(lock.fd),
             str(state.root),
+            str(int(parallel)),
         ]
         try:
             process = subprocess.Popen(
@@ -1203,7 +1447,7 @@ def build_parser() -> argparse.ArgumentParser:
     remove_parser = subparsers.add_parser("rm", help="remove one or more commands")
     remove_parser.add_argument("ids", type=positive_id, nargs="+")
 
-    run_parser = subparsers.add_parser("run", help="run the queued commands sequentially")
+    run_parser = subparsers.add_parser("run", help="run the queued commands")
     run_parser.add_argument(
         "-b",
         "--background",
@@ -1215,6 +1459,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="continue after a command exits unsuccessfully",
     )
+    run_parser.add_argument(
+        "--parralel",
+        "--parallel",
+        dest="parallel",
+        action="store_true",
+        help="run all queued commands in parallel",
+    )
 
     log_parser = subparsers.add_parser("log", help="read or manage run logs")
     group = log_parser.add_mutually_exclusive_group()
@@ -1225,7 +1476,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def internal_worker(arguments: Sequence[str]) -> int:
-    if len(arguments) != 4:
+    if len(arguments) not in (4, 5):
         return 2
     try:
         run_id = positive_id(arguments[0])
@@ -1233,6 +1484,7 @@ def internal_worker(arguments: Sequence[str]) -> int:
         lock_fd = int(arguments[2])
         if lock_fd < 0:
             return 2
+        parallel = bool(int(arguments[4])) if len(arguments) == 5 else False
     except (ValueError, argparse.ArgumentTypeError):
         return 2
     state = State(Path(arguments[3]))
@@ -1240,7 +1492,7 @@ def internal_worker(arguments: Sequence[str]) -> int:
     with WorkerSignalRelay() as signal_relay:
         try:
             state.initialize()
-            return run_worker(state, run_id, token, signal_relay)
+            return run_worker(state, run_id, token, signal_relay, parallel)
         except BaseException as error:
             try:
                 mark_spawn_failed(state, run_id, f"worker failed: {error}")
@@ -1281,7 +1533,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             remove_commands(state, parsed.ids)
             return 0
         if parsed.subcommand == "run":
-            return execute_run(state, parsed.background, parsed.no_exit_on_error)
+            return execute_run(
+                state, parsed.background, parsed.no_exit_on_error, parsed.parallel
+            )
         if parsed.subcommand == "log":
             if parsed.list:
                 if parsed.run_id is not None:

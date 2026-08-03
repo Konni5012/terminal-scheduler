@@ -140,6 +140,44 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("Queue is empty", self.cli("list").stdout)
         self.assertIn("1 failure", self.cli("log").stdout)
 
+    def test_parallel_run_executes_queued_commands_concurrently(self) -> None:
+        self.add("sleep 0.6; echo parallel-first")
+        self.add("sleep 0.6; echo parallel-second")
+        started_at = time.monotonic()
+        result = self.cli("run", "--parralel")
+        elapsed = time.monotonic() - started_at
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 1.05)
+        self.assertIn("parallel-first", result.stdout)
+        self.assertIn("parallel-second", result.stdout)
+        self.assertIn("✓ succeeded · 2 commands", result.stdout)
+        self.assertIn("Queue is empty", self.cli("list").stdout)
+
+    def test_parallel_run_attempts_all_commands_and_reports_failures(self) -> None:
+        self.add("echo parallel-failed; false")
+        self.add("sleep 0.1; echo parallel-continued")
+        result = self.cli("run", "--parralel")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("parallel-failed", result.stdout)
+        self.assertIn("parallel-continued", result.stdout)
+        self.assertIn("✗ failed · 2/2 commands · 1 failure", result.stdout)
+        self.assertIn("Queue is empty", self.cli("list").stdout)
+
+    def test_parallel_background_run_executes_all_commands(self) -> None:
+        first = self.work / "parallel-background-first"
+        second = self.work / "parallel-background-second"
+        self.add(f"sleep 0.5; echo first > {first}")
+        self.add(f"sleep 0.5; echo second > {second}")
+        started = self.cli("run", "--background", "--parralel")
+
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.wait_until_idle()
+        self.assertEqual(first.read_text().strip(), "first")
+        self.assertEqual(second.read_text().strip(), "second")
+        self.assertRegex(self.cli("log", "--list").stdout, r"(?m)^1\s+succeeded\s+")
+
     def test_background_returns_quickly_and_logs_output(self) -> None:
         marker = self.work / "background-finished"
         self.add(f"sleep 1; echo detached > {marker}")

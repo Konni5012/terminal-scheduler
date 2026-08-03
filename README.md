@@ -1,6 +1,6 @@
 # schedule
 
-`schedule` is a persistent sequential command queue for the Fish shell. It runs
+`schedule` is a persistent command queue for the Fish shell. It runs
 on macOS and Linux using only Python 3.9+ and Fish.
 
 ## Install
@@ -35,9 +35,19 @@ Run the queue in the foreground:
 schedule run
 ```
 
-Foreground output is streamed to the terminal and saved to a log. By default,
-the run stops at the first failed command. The attempted command is removed,
-and commands not yet attempted remain queued.
+Foreground output is streamed to the terminal and saved to a log. Commands run
+sequentially by default. The run stops at the first failed command. The
+attempted command is removed, and commands not yet attempted remain queued.
+
+Run all queued commands concurrently with:
+
+```fish
+schedule run --parralel
+```
+
+The correctly spelled `--parallel` alias is also accepted. Parallel runs
+attempt every queued command; a failure makes the overall run fail after the
+other commands finish. Output from concurrent commands may interleave.
 
 Continue through failures with:
 
