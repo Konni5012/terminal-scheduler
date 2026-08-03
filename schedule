@@ -303,7 +303,7 @@ class WorkerSignalRelay:
     def __init__(self) -> None:
         self.processes: dict[int, subprocess.Popen[bytes]] = {}
         self.lock = threading.RLock()
-        self.process_start_lock = threading.Lock()
+        self.process_start_lock = threading.RLock()
         self.received: Optional[int] = None
         self.suspended = False
         self.previous_handlers: dict[int, object] = {}
@@ -1190,6 +1190,7 @@ def wait_for_parallel_items(
     escalation = 0
     deadline: Optional[float] = None
     worker_error: Optional[BaseException] = None
+    processed_futures: set[Future[Optional[int]]] = set()
 
     def request_stop(signal_number: int) -> None:
         nonlocal interruption_signal, stop_signal, escalation, deadline
@@ -1203,12 +1204,36 @@ def wait_for_parallel_items(
             for future in futures:
                 future.cancel()
 
+    def collect_done_futures() -> None:
+        nonlocal interruption_signal, worker_error
+        for future in futures:
+            if future in processed_futures or not future.done():
+                continue
+            processed_futures.add(future)
+            if future.cancelled():
+                continue
+            item_interruption_signal: Optional[int] = None
+            try:
+                item_interruption_signal = future.result()
+            except WorkerTermination as termination:
+                request_stop(termination.signal_number)
+                continue
+            except CancelledError:
+                continue
+            except BaseException as error:
+                if worker_error is None:
+                    worker_error = error
+                request_stop(signal.SIGTERM)
+            if interruption_signal is None and item_interruption_signal is not None:
+                interruption_signal = item_interruption_signal
+
     while True:
         try:
             if writer is not None:
                 writer.flush_stdout()
             if interruption_signal is None and signal_relay.received is not None:
                 request_stop(signal_relay.received)
+            collect_done_futures()
             if all(future.done() for future in futures):
                 break
             time.sleep(0.05)
@@ -1227,23 +1252,6 @@ def wait_for_parallel_items(
                 escalation = 3
                 deadline = None
 
-    for future in futures:
-        if future.cancelled():
-            continue
-        item_interruption_signal: Optional[int] = None
-        try:
-            item_interruption_signal = future.result()
-        except WorkerTermination as termination:
-            request_stop(termination.signal_number)
-            continue
-        except CancelledError:
-            continue
-        except BaseException as error:
-            if worker_error is None:
-                worker_error = error
-            request_stop(signal.SIGTERM)
-        if interruption_signal is None and item_interruption_signal is not None:
-            interruption_signal = item_interruption_signal
     if worker_error is not None:
         raise worker_error
     return interruption_signal or signal_relay.received
