@@ -237,6 +237,50 @@ class ScheduleTests(unittest.TestCase):
         self.assertGreaterEqual(len(result.stdout), 2097152)
         self.assertIn("✓ succeeded", result.stdout)
 
+    def test_parallel_foreground_interrupts_during_output_drain(self) -> None:
+        self.add("yes x | head -c 2097152")
+        process = subprocess.Popen(
+            [str(SCHEDULE), "run", "--parallel"],
+            cwd=self.work,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            command_finished = False
+            while time.monotonic() < deadline:
+                if (self.state / "schedule.db").exists():
+                    connection = self.database()
+                    try:
+                        row = connection.execute(
+                            "SELECT status FROM run_items ORDER BY run_id DESC, sequence DESC LIMIT 1"
+                        ).fetchone()
+                    finally:
+                        connection.close()
+                    if row is not None and row["status"] == "succeeded":
+                        command_finished = True
+                        break
+                time.sleep(0.05)
+            self.assertTrue(command_finished, "parallel command did not finish")
+            process.send_signal(signal.SIGINT)
+            process.wait(timeout=10)
+            _, stderr = process.communicate(timeout=2)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+        self.assertEqual(process.returncode, 130, stderr)
+        connection = self.database()
+        try:
+            row = connection.execute(
+                "SELECT status, exit_code FROM runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual((row["status"], row["exit_code"]), ("interrupted", 130))
+
     def test_parallel_foreground_preserves_sigtstp_job_control(self) -> None:
         first_started = self.work / "sigtstp-first-started"
         second_started = self.work / "sigtstp-second-started"

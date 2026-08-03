@@ -11,6 +11,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+from queue import Empty, Full, Queue
 import shutil
 import signal
 import select
@@ -35,6 +36,7 @@ TERMINATION_GRACE_SECONDS = 5.0
 DEFAULT_MAX_PARALLEL_WORKERS = 32
 MAX_DEFERRED_STDOUT_BYTES = 1024 * 1024
 STDOUT_SPOOL_COPY_BYTES = 64 * 1024
+STDOUT_FORWARD_QUEUE_CHUNKS = 256
 
 
 class ScheduleError(Exception):
@@ -699,6 +701,10 @@ class LogWriter:
         self.stdout_spool_read_offset = 0
         self.stdout_spool_write_offset = 0
         self.pending_stdout: Optional[bytearray] = None
+        self.stdout_queue: Optional[Queue] = None
+        self.stdout_forwarder: Optional[threading.Thread] = None
+        self.stdout_forwarder_stop = threading.Event()
+        self.stdout_forwarder_busy = False
 
     @contextmanager
     def defer_stdout(self) -> Iterator[None]:
@@ -723,7 +729,46 @@ class LogWriter:
         self.stdout_spool = spool
         self.stdout_spool_read_offset = 0
         self.stdout_spool_write_offset = 0
+        self.stdout_queue = Queue(maxsize=STDOUT_FORWARD_QUEUE_CHUNKS)
+        self.stdout_forwarder_stop.clear()
+        self.stdout_forwarder_busy = False
         self.stdout_deferred = True
+        self.stdout_forwarder = threading.Thread(
+            target=self._forward_stdout,
+            name="schedule-stdout",
+            daemon=True,
+        )
+        self.stdout_forwarder.start()
+
+    def _forward_stdout(self) -> None:
+        with self.lock:
+            queue = self.stdout_queue
+            descriptor = self.stdout_fd
+            stop = self.stdout_forwarder_stop
+        if queue is None or descriptor is None:
+            return
+        while True:
+            try:
+                data = queue.get(timeout=0.05)
+            except Empty:
+                if stop.is_set():
+                    return
+                continue
+            if data is None:
+                queue.task_done()
+                return
+            with self.lock:
+                self.stdout_forwarder_busy = True
+            try:
+                write_all_fd(descriptor, data)
+            except BaseException:
+                with self.lock:
+                    self.stdout_broken = True
+                return
+            finally:
+                with self.lock:
+                    self.stdout_forwarder_busy = False
+                queue.task_done()
 
     def _stop_deferred_stdout(self) -> None:
         with self.lock:
@@ -734,6 +779,18 @@ class LogWriter:
             self.stdout_spool_read_offset = 0
             self.stdout_spool_write_offset = 0
             self.pending_stdout = None
+            queue = self.stdout_queue
+            forwarder = self.stdout_forwarder
+            self.stdout_queue = None
+            self.stdout_forwarder = None
+            self.stdout_forwarder_stop.set()
+        if queue is not None:
+            try:
+                queue.put_nowait(None)
+            except Full:
+                pass
+        if forwarder is not None and forwarder is not threading.current_thread():
+            forwarder.join(timeout=0.1)
         if spool is not None:
             spool.close()
 
@@ -788,53 +845,46 @@ class LogWriter:
                     or self.stdout_broken
                     or self.stdout_fd is None
                     or self.stdout_spool is None
+                    or self.stdout_queue is None
                 ):
                     return self.pending_stdout is None
-                descriptor = self.stdout_fd
                 spool = self.stdout_spool
+                queue = self.stdout_queue
                 if self.pending_stdout is None:
                     if self.stdout_spool_read_offset >= self.stdout_spool_write_offset:
-                        return True
-                    spool.seek(self.stdout_spool_read_offset)
-                    self.pending_stdout = bytearray(spool.read(4096))
-                    if not self.pending_stdout:
+                        pending = None
+                    else:
+                        spool.seek(self.stdout_spool_read_offset)
+                        self.pending_stdout = bytearray(spool.read(4096))
+                        if not self.pending_stdout:
+                            return False
+                        self.stdout_spool_read_offset += len(self.pending_stdout)
+                        pending = bytes(self.pending_stdout)
+                else:
+                    pending = bytes(self.pending_stdout)
+
+            stopping = should_stop is not None and should_stop()
+            if pending is not None:
+                try:
+                    queue.put_nowait(pending)
+                except Full:
+                    if stopping or not wait:
                         return False
-                    self.stdout_spool_read_offset += len(self.pending_stdout)
-                chunk = self.pending_stdout
-            try:
-                stopping = should_stop is not None and should_stop()
-                timeout = 0.0 if stopping or not wait else 0.05
-                _, writable, _ = select.select([], [descriptor], [], timeout)
-            except InterruptedError:
+                    time.sleep(0.05)
+                    continue
+                with self.lock:
+                    self.pending_stdout = None
+                    self._maybe_compact_stdout_spool_locked()
                 continue
-            except (OSError, ValueError):
-                with self.lock:
-                    self.stdout_broken = True
-                    self.pending_stdout = None
-                return False
-            if not writable:
-                return False
-            try:
-                written = os.write(descriptor, chunk[:4096])
-            except BlockingIOError:
-                return False
-            except InterruptedError:
-                continue
-            except OSError:
-                with self.lock:
-                    self.stdout_broken = True
-                    self.pending_stdout = None
-                return False
-            if written <= 0:
-                with self.lock:
-                    self.stdout_broken = True
-                    self.pending_stdout = None
-                return False
+
             with self.lock:
-                del chunk[:written]
-                if not chunk:
-                    self.pending_stdout = None
-                self._maybe_compact_stdout_spool_locked()
+                queue_empty = queue.empty()
+                forwarder_busy = self.stdout_forwarder_busy
+            if queue_empty and not forwarder_busy:
+                return True
+            if stopping or not wait:
+                return False
+            time.sleep(0.05)
 
     def write(self, data: bytes) -> None:
         with self.lock:
@@ -1378,6 +1428,7 @@ def run_parallel_items(
         parallel_relay.request_stop(signal.SIGTERM)
     finally:
         executor.shutdown(wait=True, cancel_futures=parallel_relay.received is not None)
+        parallel_relay.raise_worker_termination = True
 
     if worker_error is not None:
         try:
@@ -1404,6 +1455,14 @@ def run_parallel_items(
     else:
         status = "succeeded"
         overall_exit = 0
+
+    writer.flush_stdout(
+        wait=True, should_stop=lambda: parallel_relay.received is not None
+    )
+    final_signal = parallel_relay.received
+    if status == "succeeded" and final_signal is not None:
+        status = "interrupted"
+        overall_exit = 128 + final_signal
     with transaction(connection, immediate=True):
         connection.execute(
             """
@@ -1425,6 +1484,27 @@ def run_parallel_items(
     writer.flush_stdout(
         wait=True, should_stop=lambda: parallel_relay.received is not None
     )
+    final_signal = parallel_relay.received
+    if status == "succeeded" and final_signal is not None:
+        status = "interrupted"
+        overall_exit = 128 + final_signal
+        with transaction(connection, immediate=True):
+            connection.execute(
+                "UPDATE runs SET status = ?, finished_at = ?, exit_code = ? WHERE id = ?",
+                (status, utc_now(), overall_exit, run_id),
+            )
+        writer.line(
+            run_summary(
+                status,
+                attempted,
+                int(run["total"]),
+                failures,
+                overall_exit,
+            )
+        )
+        writer.flush_stdout(
+            wait=False, should_stop=lambda: parallel_relay.received is not None
+        )
     return overall_exit
 
 
