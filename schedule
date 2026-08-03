@@ -888,6 +888,32 @@ def command_result(
                     return_code = process.wait()
             except ProcessLookupError:
                 return_code = process.wait()
+    except BaseException:
+        try:
+            if process.poll() is None:
+                if not foreground or separate_process_group:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                else:
+                    process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    if not foreground or separate_process_group:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    process.wait()
+        except BaseException:
+            pass
+        raise
     finally:
         if signal_relay is not None:
             signal_relay.detach(process)
@@ -895,6 +921,67 @@ def command_result(
     if signal_relay is not None and signal_relay.received is not None:
         interruption_signal = signal_relay.received
     return normalized_exit_code(return_code), interruption_signal
+
+
+def safe_log_line(writer: OutputWriter, text: str) -> None:
+    try:
+        writer.line(text)
+    except BaseException:
+        pass
+
+
+def record_parallel_item_failure(
+    state: State, run_id: int, item_id: int, message: str
+) -> None:
+    connection = state.connect()
+    try:
+        finished_at = utc_now()
+        with transaction(connection, immediate=True):
+            connection.execute(
+                "UPDATE run_items SET status = 'failed', finished_at = ?, exit_code = 1 "
+                "WHERE run_id = ? AND queue_id = ?",
+                (finished_at, run_id, item_id),
+            )
+            connection.execute("DELETE FROM queue WHERE id = ?", (item_id,))
+            connection.execute(
+                "UPDATE runs SET attempted = attempted + 1, failures = failures + 1, "
+                "message = ? WHERE id = ?",
+                (message, run_id),
+            )
+    finally:
+        connection.close()
+
+
+def mark_running_parallel_items_failed(state: State, run_id: int) -> int:
+    connection = state.connect()
+    try:
+        rows = list(
+            connection.execute(
+                "SELECT queue_id FROM run_items WHERE run_id = ? AND status = 'running'",
+                (run_id,),
+            )
+        )
+        if not rows:
+            return 0
+        finished_at = utc_now()
+        with transaction(connection, immediate=True):
+            for row in rows:
+                item_id = int(row["queue_id"])
+                connection.execute(
+                    "UPDATE run_items SET status = 'failed', finished_at = ?, exit_code = 1 "
+                    "WHERE run_id = ? AND queue_id = ?",
+                    (finished_at, run_id, item_id),
+                )
+                connection.execute("DELETE FROM queue WHERE id = ?", (item_id,))
+            count = len(rows)
+            connection.execute(
+                "UPDATE runs SET attempted = attempted + ?, failures = failures + ? "
+                "WHERE id = ?",
+                (count, count, run_id),
+            )
+        return len(rows)
+    finally:
+        connection.close()
 
 
 def run_parallel_item(
@@ -908,8 +995,11 @@ def run_parallel_item(
 ) -> Optional[int]:
     item_id = int(item["queue_id"])
     item_writer = writer.command()
-    connection = state.connect()
+    connection: Optional[sqlite3.Connection] = None
+    item_interruption_signal: Optional[int] = None
+    item_recorded = False
     try:
+        connection = state.connect()
         started_at = utc_now()
         with transaction(connection, immediate=True):
             connection.execute(
@@ -943,13 +1033,29 @@ def run_parallel_item(
                 "WHERE id = ?",
                 (int(failed), run_id),
             )
-        if item_writer.last_byte != b"\n":
-            item_writer.line()
-        if failed:
-            item_writer.line(f"✗ exit {exit_code}")
+        item_recorded = True
+        try:
+            if item_writer.last_byte != b"\n":
+                item_writer.line()
+            if failed:
+                item_writer.line(f"✗ exit {exit_code}")
+        except BaseException as error:
+            safe_log_line(item_writer, f"schedule: could not finish command output: {error}")
+        return item_interruption_signal
+    except WorkerTermination:
+        raise
+    except BaseException as error:
+        message = f"parallel command {item_id} failed: {error}"
+        if not item_recorded:
+            record_parallel_item_failure(state, run_id, item_id, message)
+        safe_log_line(item_writer, message)
         return item_interruption_signal
     finally:
-        connection.close()
+        if connection is not None:
+            try:
+                connection.close()
+            except BaseException:
+                pass
 
 
 def wait_for_parallel_items(
@@ -960,6 +1066,7 @@ def wait_for_parallel_items(
     stop_signal: Optional[int] = None
     escalation = 0
     deadline: Optional[float] = None
+    worker_error: Optional[BaseException] = None
 
     def request_stop(signal_number: int) -> None:
         nonlocal interruption_signal, stop_signal, escalation, deadline
@@ -998,6 +1105,7 @@ def wait_for_parallel_items(
     for future in futures:
         if future.cancelled():
             continue
+        item_interruption_signal: Optional[int] = None
         try:
             item_interruption_signal = future.result()
         except WorkerTermination as termination:
@@ -1005,8 +1113,14 @@ def wait_for_parallel_items(
             continue
         except CancelledError:
             continue
+        except BaseException as error:
+            if worker_error is None:
+                worker_error = error
+            request_stop(signal.SIGTERM)
         if interruption_signal is None and item_interruption_signal is not None:
             interruption_signal = item_interruption_signal
+    if worker_error is not None:
+        raise worker_error
     return interruption_signal or signal_relay.received
 
 
@@ -1031,6 +1145,8 @@ def run_parallel_items(
     futures: list[Future[Optional[int]]] = []
     submission_signal: Optional[int] = None
     submission_error: Optional[str] = None
+    interruption_signal: Optional[int] = None
+    worker_error: Optional[BaseException] = None
     try:
         for item in items:
             if parallel_relay.received is not None:
@@ -1062,10 +1178,22 @@ def run_parallel_items(
         if submission_signal is not None:
             parallel_relay.request_stop(submission_signal)
         if submission_error is not None:
-            writer.line(f"schedule: could not schedule parallel commands: {submission_error}")
+            safe_log_line(
+                writer, f"schedule: could not schedule parallel commands: {submission_error}"
+            )
         interruption_signal = wait_for_parallel_items(futures, parallel_relay)
+    except BaseException as error:
+        worker_error = error
+        parallel_relay.request_stop(signal.SIGTERM)
     finally:
         executor.shutdown(wait=True, cancel_futures=parallel_relay.received is not None)
+
+    if worker_error is not None:
+        try:
+            mark_running_parallel_items_failed(state, run_id)
+        except BaseException as cleanup_error:
+            safe_log_line(writer, f"schedule: could not record parallel failure: {cleanup_error}")
+        safe_log_line(writer, f"schedule: parallel worker failed: {worker_error}")
 
     progress = connection.execute(
         "SELECT attempted, failures FROM runs WHERE id = ?", (run_id,)
@@ -1073,7 +1201,10 @@ def run_parallel_items(
     assert progress is not None
     attempted = int(progress["attempted"])
     failures = int(progress["failures"])
-    if interruption_signal is not None:
+    if worker_error is not None:
+        status = "failed"
+        overall_exit = 1
+    elif interruption_signal is not None:
         status = "interrupted"
         overall_exit = 128 + interruption_signal
     elif failures:
@@ -1285,6 +1416,15 @@ def execute_run(
             return 0
 
         if not background:
+            if parallel:
+                with WorkerSignalRelay() as foreground_signal_relay:
+                    return run_worker(
+                        state,
+                        run_id,
+                        token,
+                        signal_relay=foreground_signal_relay,
+                        parallel=True,
+                    )
             return run_worker(state, run_id, token, parallel=parallel)
 
         assert lock.fd is not None
