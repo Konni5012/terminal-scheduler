@@ -1007,6 +1007,7 @@ def run_parallel_item(
                 "WHERE run_id = ? AND queue_id = ?",
                 (started_at, run_id, item_id),
             )
+        item_writer.line(f"[{item_id}] {terminal_text(str(item['command']).strip())}")
         exit_code, item_interruption_signal = command_result(
             item_writer,
             fish_path,
@@ -1136,8 +1137,6 @@ def run_parallel_items(
     signal_relay: Optional[WorkerSignalRelay],
 ) -> int:
     parallel_relay = signal_relay or WorkerSignalRelay()
-    for item in items:
-        writer.line(f"[{int(item['queue_id'])}] {terminal_text(str(item['command']).strip())}")
 
     executor = ThreadPoolExecutor(
         max_workers=parallel_worker_limit(len(items)), thread_name_prefix="schedule"
