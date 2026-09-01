@@ -6,6 +6,8 @@ source_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 destination="$install_prefix/bin"
 
 mkdir -p "$destination"
+install -m 755 "$source_dir/schedule-core" "$destination/schedule-core"
+install -m 644 "$source_dir/schedule_supervisor.py" "$destination/schedule_supervisor.py"
 install -m 755 "$source_dir/schedule" "$destination/schedule"
 
 echo "Installed schedule to $destination/schedule"

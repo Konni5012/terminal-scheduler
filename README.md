@@ -1,7 +1,7 @@
 # schedule
 
-`schedule` is a persistent command queue for the Fish shell. It runs
-on macOS and Linux using only Python 3.9+ and Fish.
+`schedule` is a persistent command queue for the Fish shell. It runs on macOS
+and Linux using only Python 3.9+ and Fish.
 
 ## Install
 
@@ -10,8 +10,9 @@ on macOS and Linux using only Python 3.9+ and Fish.
 fish_add_path ~/.local/bin
 ```
 
-The installer honors `PREFIX`. The executable is self-contained, so it may also
-be copied directly to any directory in `PATH`.
+The installer honors `PREFIX`. The installed command consists of the `schedule`
+entry point, `schedule-core`, and `schedule_supervisor.py`; keep those three
+files together when installing without the script.
 
 ## Usage
 
@@ -26,8 +27,8 @@ schedule rm 1
 ```
 
 Each command remembers the working directory from which it was added. IDs are
-stable and monotonically increasing. `mv` swaps the queue
-positions of two IDs; `rm` accepts one or more IDs.
+stable and monotonically increasing. `mv` swaps the queue positions of two IDs;
+`rm` accepts one or more IDs.
 
 Run the queue in the foreground:
 
@@ -60,16 +61,57 @@ Continue through failures with:
 schedule run --no-exit-on-error
 ```
 
+## Reboot-resilient background runs
+
 Detach a run from the terminal and SSH session with:
 
 ```fish
 schedule run --background
 ```
 
-The command returns immediately. The detached worker and its commands have no
-terminal input and write their output only to the run log. Detachment survives
-an ordinary SSH disconnect or logout, but is not designed to survive a reboot
-or a host policy that explicitly kills all user processes on logout.
+When a user service manager is available, `schedule` registers the run as a
+persistent per-user service:
+
+- Linux uses `systemd --user`. The worker and every command stay in the service
+  cgroup even though individual commands have their own process groups.
+- macOS uses a per-user `launchd` agent.
+
+The registration and a private snapshot of the launch environment remain only
+while the run is active. After a reboot, the service starts again when the user
+service manager starts. Commands completed before the reboot are not repeated;
+the command interrupted by the reboot starts again from the beginning, followed
+by every command still queued at restart, including commands added while the
+earlier run was active. Commands with external side effects should therefore be
+safe to retry.
+
+A normal Linux user manager starts at login. To resume before login as well,
+enable lingering for the account once:
+
+```fish
+loginctl enable-linger $USER
+```
+
+A macOS LaunchAgent resumes when the user logs in. If no supported user service
+is available, `schedule` prints a warning and uses the previous detached mode,
+which survives logout but not reboot. Set `SCHEDULE_SUPERVISOR` to control this:
+
+```fish
+set -x SCHEDULE_SUPERVISOR auto     # default
+set -x SCHEDULE_SUPERVISOR systemd  # require systemd --user
+set -x SCHEDULE_SUPERVISOR launchd  # require a launchd user domain
+set -x SCHEDULE_SUPERVISOR off      # always use detached mode
+```
+
+Forcing a manager fails instead of silently dropping reboot recovery when that
+manager is unavailable. Once a manager is selected, setup failures are also
+reported as errors rather than racing a second, unsupervised background run.
+
+Background commands have no terminal input and write their output only to the
+run log. Only one run can be active. While it runs, `add`, `list`, and `log`
+remain available; `mv`, `rm`, and a second `run` are rejected. Commands added
+during a run wait for the next run.
+
+## Logs
 
 Inspect logs with:
 
@@ -83,10 +125,6 @@ schedule log --clear
 `schedule log` displays the latest run. Completed logs are retained until
 cleared. Logs combine stdout and stderr in observed order.
 
-Only one run can be active. While it runs, `add`, `list`, and `log` remain
-available; `mv`, `rm`, and a second `run` are rejected. Commands added during a
-run wait for the next run.
-
 ## State and environment
 
 State is stored in `${XDG_STATE_HOME}/schedule`, or
@@ -96,6 +134,8 @@ for testing.
 
 Every entry runs in a separate `fish -c` process. Commands inherit the
 environment present when `schedule run` starts; shell-local changes made by one
-entry do not carry into the next. Fish syntax is checked when a command is
-added, while command availability and other runtime failures are determined
-during execution.
+entry do not carry into the next. For a supervised background run, that
+environment and the invocation directory are saved in `supervisor.json` with
+mode `0600` so they can be restored after reboot, then deleted when the run
+finishes. Fish syntax is checked when a command is added, while command
+availability and other runtime failures are determined during execution.
