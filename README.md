@@ -11,8 +11,36 @@ fish_add_path ~/.local/bin
 ```
 
 The installer honors `PREFIX`. The installed command consists of the `schedule`
-entry point, `schedule-core`, and `schedule_supervisor.py`; keep those three
-files together when installing without the script.
+entry point, `schedule-core`, `schedule_supervisor.py`, and
+`schedule_update.py`; keep those four files together when installing without
+the script.
+
+## Update
+
+Update the installed command from the latest commit on GitHub's `main` branch:
+
+```fish
+schedule update
+```
+
+The updater resolves `main` to one commit, downloads every command file from
+that exact commit, validates the UTF-8 contents and Python syntax, stages the
+complete bundle in the installation directory, and replaces the public entry
+point last. If replacement fails, files already changed are rolled back. The
+update runs only when explicitly invoked and requires network access plus write
+permission for the installation directory.
+
+Check without changing any files:
+
+```fish
+schedule update --check
+```
+
+The check exits with status `0` when the installed bundle matches `main` and
+status `1` when an update is available. Use `schedule update --force` to
+reinstall the current `main` bundle. A source checkout or symlinked installation
+is not overwritten; update a checkout with Git or reinstall the standalone
+command instead.
 
 ## Usage
 
